@@ -1,4 +1,4 @@
-﻿"""A cursor-relative floating input bar with a local echo for testing."""
+"""Animated cursor-relative assistant, backed by the asynchronous local pipeline."""
 
 import ctypes
 import math
@@ -6,15 +6,37 @@ import sys
 import time
 from enum import Enum, auto
 
-from PySide6.QtCore import QEasingCurve, QEvent, QParallelAnimationGroup, QPointF, QPropertyAnimation, QRect, QRectF, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QColor, QCursor, QFont, QKeySequence, QPainter, QPalette, QPen, QShortcut, QTextDocument
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QParallelAnimationGroup,
+    QPointF,
+    QPropertyAnimation,
+    QRect,
+    QRectF,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+)
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QPen,
+    QShortcut,
+    QTextCursor,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
-    QLineEdit,
     QLayout,
+    QLineEdit,
     QMenu,
     QPlainTextEdit,
     QPushButton,
@@ -22,6 +44,10 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ai.pipeline import MotePipeline
+from ai.worker import PipelineController
+from integration.desktop import DesktopIntegration
 
 
 def _motion_enabled() -> bool:
@@ -115,10 +141,11 @@ class _ThinkingIndicator(QWidget):
     def __init__(self, parent):
         super().__init__(parent)
         self.phase = 0.0
+        self.text = "Routing…"
         self.opacity = 1.0
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAccessibleName("Thinking...")
-        self.setGeometry(12, 5, 250, 40)
+        self.setGeometry(12, 5, 350, 40)
         self.pulse = QVariantAnimation(self)
         self.pulse.setStartValue(0.0)
         self.pulse.setEndValue(2 * math.pi)
@@ -140,7 +167,7 @@ class _ThinkingIndicator(QWidget):
             painter.setBrush(QColor(200, 215, 232, round(255 * alpha)))
             painter.drawEllipse(QRectF(index * 12, 17, 5, 5))
         painter.setPen(QColor(185, 194, 207, round(255 * self.opacity)))
-        painter.drawText(QRect(46, 0, 180, 40), Qt.AlignmentFlag.AlignVCenter, "Thinking...")
+        painter.drawText(QRect(46, 0, max(0, self.width() - 46), 40), Qt.AlignmentFlag.AlignVCenter, self.text)
 
 
 class AssistantPopup(QWidget):
@@ -155,7 +182,7 @@ class AssistantPopup(QWidget):
     FOLLOW_GRACE = 0.32
     FOLLOW_LAG = 0.12
 
-    def __init__(self) -> None:
+    def __init__(self, *, pipeline=None) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Mote")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -164,8 +191,11 @@ class AssistantPopup(QWidget):
         self.state = PopupState.CLOSED
         self.motion_enabled = _motion_enabled()
         self._response_height = 100
-        self._pending_text = None
-        self._ready = False
+        self._request_id = None
+        self.request_state = "Idle"
+        self._stream_buffer = []
+        self._stream_started = False
+        self._stream_done = False
         self._rest_geometry = None
         self.follow_enabled = True
         self._follow_paused = False
@@ -190,10 +220,19 @@ class AssistantPopup(QWidget):
         self._reveal.valueChanged.connect(self._reveal_text)
         self._thinking_fade = QVariantAnimation(self)
         self._thinking_fade.valueChanged.connect(self._fade_thinking)
-        self._thinking_fade.finished.connect(self._show_response)
-        self._echo_timer = QTimer(self)
-        self._echo_timer.setSingleShot(True)
-        self._echo_timer.timeout.connect(self._response_ready)
+        self._thinking_fade.finished.connect(self._show_stream)
+        self._stream_timer = QTimer(self)
+        self._stream_timer.setInterval(32)
+        self._stream_timer.timeout.connect(self._flush_stream)
+        self.controller = PipelineController(pipeline or MotePipeline(), self)
+        self.desktop = DesktopIntegration(self)
+        self.controller.status.connect(self._pipeline_status)
+        self.controller.partial.connect(self._pipeline_partial)
+        self.controller.completed.connect(self._pipeline_completed)
+        self.controller.failed.connect(self._pipeline_failed)
+        self.controller.desktop_requested.connect(self.desktop.handle)
+        self.controller.stopped.connect(QApplication.instance().quit)
+        QApplication.instance().aboutToQuit.connect(self.controller.shutdown)
         self.backdrop_status = "Translucent fallback (native backdrop not initialized)"
         self._backdrop_timer = QTimer(self)
         self._backdrop_timer.setSingleShot(True)
@@ -260,14 +299,14 @@ class AssistantPopup(QWidget):
         self.prompt.installEventFilter(self.input_bar)
         self.prompt.setPlaceholderText("Ask Mote anything...")
         self.prompt.setAccessibleName("Ask Mote anything")
-        self.prompt.setToolTip("Enter to send · Esc to hide · Ctrl+Q to quit")
+        self.prompt.setToolTip("Enter to send · Ask about your screen for automatic capture · Esc to hide · Ctrl+Q to quit")
         self.prompt.returnPressed.connect(self.submit)
         entry = QVBoxLayout(self.input_bar)
         entry.setContentsMargins(20, 10, 20, 12)
         entry.setSpacing(6)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
-        for glyph, name in (("\ue720", "Microphone"), ("\ue722", "Screenshot"), ("\ue710", "Add attachment")):
+        for glyph, name in (("\ue720", "Microphone"), ("\ue710", "Add attachment")):
             button = QPushButton(glyph)
             button.setFont(QFont("Segoe MDL2 Assets", 12))
             button.setFixedSize(32, 32)
@@ -299,7 +338,7 @@ class AssistantPopup(QWidget):
         self.response = QPlainTextEdit()
         self.response.setObjectName("response")
         self.response.setReadOnly(True)
-        self.response.setAccessibleName("Local echo response")
+        self.response.setAccessibleName("Mote response")
         self.response.setMinimumHeight(0)
         self.response.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         # The viewport must not paint an opaque rectangle over the glass surface.
@@ -330,7 +369,7 @@ class AssistantPopup(QWidget):
         self.quit_shortcut = QShortcut(self)
         self.quit_shortcut.setKey(QKeySequence("Ctrl+Q"))
         self.quit_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
-        self.quit_shortcut.activated.connect(QApplication.instance().quit)
+        self.quit_shortcut.activated.connect(self._request_quit)
 
         # Add window actions to the editors' standard right-click menus.
         for widget in (self, self.input_bar, self.prompt, self.response):
@@ -341,10 +380,9 @@ class AssistantPopup(QWidget):
 
     def event(self, event) -> bool:
         result = super().event(event)
-        if event.type() in (QEvent.Type.WinIdChange, QEvent.Type.Show):
-            # Defer until Qt has finished creating/applying the native window styles.
-            if hasattr(self, "_backdrop_timer"):
-                self._backdrop_timer.start(0)
+        # Defer until Qt has finished creating/applying the native window styles.
+        if event.type() in (QEvent.Type.WinIdChange, QEvent.Type.Show) and hasattr(self, "_backdrop_timer"):
+            self._backdrop_timer.start(0)
         return result
 
     def _configure_backdrop(self) -> None:
@@ -403,7 +441,7 @@ class AssistantPopup(QWidget):
         if menu.actions():
             menu.addSeparator()
         menu.addAction("Hide Mote\tEsc", self.dismiss)
-        menu.addAction("Quit Mote\tCtrl+Q", QApplication.instance().quit)
+        menu.addAction("Quit Mote\tCtrl+Q", self._request_quit)
         self._pause_following()
         menu.exec(target.mapToGlobal(position))
         menu.deleteLater()
@@ -436,11 +474,12 @@ class AssistantPopup(QWidget):
             # move a pinned window merely because the hotkey was pressed again.
             self._focus_prompt()
             return
+        self.desktop.remember_target()
         reopening = self.isVisible()
         self._window_transition.stop()
         self._expansion.stop()
         if reopening:
-            if not self.response.toPlainText() and self._pending_text is None:
+            if not self.response.toPlainText() and self._request_id is None:
                 self._expanded = False
                 self.response.hide()
             self._position_at_cursor()
@@ -508,6 +547,8 @@ class AssistantPopup(QWidget):
     def _follow_cursor(self) -> None:
         if not self.isVisible() or not self.follow_enabled or self.state == PopupState.CLOSING:
             self._stop_following()
+            return
+        if self.desktop.busy:
             return
         now = time.monotonic()
         elapsed = min(0.05, max(0.0, now - self._follow_last_tick))
@@ -618,14 +659,32 @@ class AssistantPopup(QWidget):
         super().hideEvent(event)
 
     def _cancel_response(self) -> None:
-        self._echo_timer.stop()
+        self.controller.cancel()
+        self.desktop.cancel_pending()
+        self._request_id = None
+        self.request_state = "Idle"
+        self._stream_timer.stop()
         self._thinking_fade.stop()
         self._reveal.stop()
         self.thinking.pulse.stop()
         self.thinking.hide()
-        self._pending_text = None
-        self._ready = False
+        self._stream_buffer.clear()
+        self._stream_started = False
+        self._stream_done = False
         self._reveal_text(1.0)
+
+    def _request_quit(self) -> None:
+        self._cancel_response()
+        self.prompt.setEnabled(False)
+        self.send_button.setEnabled(False)
+        self.response.setPlainText("Closing Mote… Waiting for the current connection to finish.")
+        self.controller.request_stop()
+
+    def closeEvent(self, event) -> None:
+        self.dismiss()
+        # QApplication.quit also sends close events. Accept them so a focused
+        # Ctrl+Q can exit; quitOnLastWindowClosed=False still lets close() hide.
+        event.accept()
 
     def _bounded_rect(self, rect):
         screen = (QApplication.screenAt(QCursor.pos()) if self.follow_enabled else self.screen())
@@ -662,28 +721,32 @@ class AssistantPopup(QWidget):
     def _expansion_finished(self) -> None:
         if self.state == PopupState.EXPANDING:
             self.state = PopupState.EXPANDED
-            if self._ready:
-                self._begin_reveal()
+            if self._stream_buffer or self._stream_done:
+                self._start_stream_reveal()
 
-    def _response_ready(self) -> None:
-        if self._pending_text is None or self.state in (PopupState.CLOSED, PopupState.CLOSING):
+    def _pipeline_status(self, request_id, text) -> None:
+        if request_id != self._request_id:
             return
-        self._ready = True
-        # Stop the pulse as soon as the response is ready; retain only its fade.
-        self.thinking.pulse.stop()
-        if self.state != PopupState.EXPANDING:
-            self._begin_reveal()
+        self.request_state = text.split("…")[0].split(" ·")[0]
+        self.send_button.setToolTip(text + " · Enter sends a new request")
+        self.thinking.text = text
+        self.thinking.setAccessibleName(text)
+        self.thinking.update()
 
-    def _begin_reveal(self) -> None:
-        self._ready = False
-        document = QTextDocument()
-        document.setDefaultFont(self.response.font())
-        document.setPlainText(self._pending_text)
-        document.setTextWidth(max(80, self.response.width() - 52))
-        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 44))
-        # One measurement per completed response, never one resize per text update.
-        if height != self._response_height:
-            self._expand_to(height)
+    def _pipeline_partial(self, request_id, text) -> None:
+        if request_id != self._request_id:
+            return
+        self._stream_buffer.append(text)
+        if not self._stream_timer.isActive():
+            self._stream_timer.start()
+        if self.state != PopupState.EXPANDING:
+            self._start_stream_reveal()
+
+    def _start_stream_reveal(self) -> None:
+        if self._stream_started:
+            return
+        self._stream_started = True
+        self.thinking.pulse.stop()
         self._thinking_fade.setStartValue(1.0)
         self._thinking_fade.setEndValue(0.0)
         self._thinking_fade.setDuration(90 if self.motion_enabled else 0)
@@ -693,18 +756,74 @@ class AssistantPopup(QWidget):
         self.thinking.opacity = float(value)
         self.thinking.update()
 
-    def _show_response(self) -> None:
-        if self._pending_text is None or self.state in (PopupState.CLOSED, PopupState.CLOSING):
+    def _show_stream(self) -> None:
+        if self._request_id is None:
             return
         self.thinking.hide()
         self._reveal_text(0.0)
-        self.response.setPlainText(self._pending_text)
-        self._pending_text = None
+        self._flush_stream()
         self._reveal.setStartValue(0.0)
         self._reveal.setEndValue(1.0)
         self._reveal.setDuration(200 if self.motion_enabled else 0)
         self._reveal.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._reveal.start()
+
+    def _flush_stream(self) -> None:
+        if not self._stream_started or self.thinking.isVisible():
+            return
+        if self._stream_buffer:
+            scrollbar = self.response.verticalScrollBar()
+            at_bottom = scrollbar.value() >= scrollbar.maximum() - 2
+            cursor = QTextCursor(self.response.document())
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText("".join(self._stream_buffer))
+            self._stream_buffer.clear()
+            if at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+        if self._stream_done:
+            self._stream_timer.stop()
+            self._finish_response_size()
+
+    def _finish_response_size(self) -> None:
+        document = QTextDocument()
+        document.setDefaultFont(self.response.font())
+        document.setPlainText(self.response.toPlainText())
+        document.setTextWidth(max(80, self.response.width() - 52))
+        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 44))
+        if height != self._response_height:
+            self._expand_to(height)
+
+    def _pipeline_completed(self, request_id, text) -> None:
+        if request_id != self._request_id:
+            return
+        # Commands have a single result rather than a model stream.
+        if not self._stream_started and not self._stream_buffer:
+            self._stream_buffer.append(text)
+        self._stream_done = True
+        self.request_state = "Idle"
+        self.send_button.setToolTip("Send prompt (Enter)")
+        if self.state != PopupState.EXPANDING:
+            self._start_stream_reveal()
+        if self._stream_started and not self.thinking.isVisible():
+            self._flush_stream()
+
+    def _pipeline_failed(self, request_id, text) -> None:
+        if request_id != self._request_id:
+            return
+        self._thinking_fade.stop()
+        self.thinking.pulse.stop()
+        self.thinking.hide()
+        self._stream_timer.stop()
+        self._stream_buffer.clear()
+        self._stream_started = True
+        self._stream_done = True
+        self._reveal.stop()
+        self._reveal_text(1.0)
+        self.response.setPlainText(text)
+        self.request_state = "Error"
+        self.send_button.setToolTip("Try again (Enter)")
+        if self.state != PopupState.EXPANDING:
+            self._finish_response_size()
 
     def _reveal_text(self, value) -> None:
         # Animate text alpha only, leaving the glass and its shadow intact.
@@ -718,12 +837,14 @@ class AssistantPopup(QWidget):
             return
         self._cancel_response()
         self.response.clear()
-        self._pending_text = f"Local echo:\n{text}\n\nAI inference is not connected in this prototype."
+        self.request_state = "Routing"
+        self.thinking.text = "Routing…"
         self.thinking.opacity = 1.0
         self.thinking.show()
         if self.motion_enabled:
             self.thinking.pulse.start()
-        self._expand_to(100 if not self._expanded else self._response_height)
-        # Only the preview simulates processing. Normal local echo is ready on
-        # the next event-loop turn, without an artificial inference delay.
-        self._echo_timer.start(650 if "--preview" in sys.argv else 0)
+        # Reserve a response panel once; token updates only append text.
+        self._expand_to(self.RESPONSE_HEIGHT)
+        self._request_id = self.controller.submit(text, self.desktop.context())
+        if self.controller.waiting:
+            self._pipeline_status(self._request_id, "Routing · waiting for previous connection…")

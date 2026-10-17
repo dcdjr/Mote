@@ -1,9 +1,9 @@
 """Windows hotkey registration using Qt's existing native event loop."""
 
 import ctypes
-from ctypes import wintypes
 import sys
 from collections.abc import Callable
+from ctypes import wintypes
 
 from PySide6.QtCore import QAbstractNativeEventFilter
 from PySide6.QtWidgets import QApplication

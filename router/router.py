@@ -2,7 +2,7 @@
 
 Install/run Ollama with gemma4:e2b, then import this file into your app:
 
-    from router import MoteRouter
+    from router.router import MoteRouter
     router = MoteRouter()
     decision = router.route("open youtube")
 
@@ -12,11 +12,12 @@ No console tester, model downloads, screenshots, or actions run from this module
 """
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
 
-__all__ = ["MoteRouter", "RouterError", "COMMANDS"]
+__all__ = ["COMMANDS", "MoteRouter", "RouterError"]
 
 
 class RouterError(RuntimeError):
@@ -214,7 +215,7 @@ def _parse_selection(text, image_attached=False):
     """Validate the declared command schema without external packages."""
     try:
         if not isinstance(text, str):
-            raise ValueError("Expected model output as JSON text.")
+            raise TypeError("Expected model output as JSON text.")
         selection = json.loads(text, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
         if not isinstance(selection, dict) or set(selection) != {"function", "arguments"}:
             raise ValueError("Expected exactly function and arguments.")
@@ -255,11 +256,14 @@ class MoteRouter:
 
     Creating the object does not start a server or load/download a model.
     Ollama must already be running with the requested model installed.
-    base_url defaults to standard Ollama; use port 11435 for this Mac's
-    existing project-local runtime.
+    Configuration defaults to MOTE_OLLAMA_HOST / MOTE_ROUTER_MODEL and the
+    standard local Ollama endpoint. No model is loaded at construction.
     """
 
-    def __init__(self, *, base_url="http://127.0.0.1:11434", model="gemma4:e2b", timeout=120):
+    def __init__(self, *, base_url=None, model=None, timeout=None):
+        base_url = base_url or os.getenv("MOTE_OLLAMA_HOST", "http://localhost:11434")
+        model = model or os.getenv("MOTE_ROUTER_MODEL", "gemma4:e2b")
+        timeout = timeout if timeout is not None else float(os.getenv("MOTE_TIMEOUT", "60"))
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
             raise ValueError("base_url must be an HTTP or HTTPS Ollama URL.")
         if not isinstance(model, str) or not model.strip():
