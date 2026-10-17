@@ -2,8 +2,9 @@
 
 Mote is a local Windows desktop assistant beside your cursor. Press
 **Ctrl+Shift+Space**, ask a question, and receive a streamed Gemma response.
-The existing AI router selects an answer, reasoning, screen context, or one
-supported Windows action. Routing and inference run off the GUI thread.
+The router selects an answer, screen context, or up to eight Windows actions.
+Explicit commands use a fast local parser; other wording uses the model.
+Routing, inference, app discovery, and audio control run off the GUI thread.
 
 ## Windows setup
 
@@ -20,7 +21,7 @@ py -m venv .venv
 Ollama's Windows app normally runs its local API in the background. If needed,
 run `ollama serve`. Mote uses that existing API; there is no separate Python
 server to launch. Python dependencies are PySide6 and the Ollama Python client
-(which installs HTTPX and Pydantic).
+(which installs HTTPX and Pydantic), plus Windows-only pycaw for audio control.
 
 The app starts hidden. Model loading happens on the first request, so the first
 answer may take longer. No models are downloaded by Mote.
@@ -43,11 +44,14 @@ answer may take longer. No models are downloaded by Mote.
 
 Examples: “Explain recursion briefly”, “Help me debug this code: …”,
 “What does the error on my screen mean?”, “Open Notepad”,
-“Open https://example.org”, or “Copy this text: Hello from Mote”.
+“Open example.org”, “Open Visual Studio Code”, “Open YouTube and set the volume to 50”,
+“What can you do?”, or “Copy this text: Hello from Mote”.
 
 ## Screen context and model capabilities
 
-Only a router decision requesting screen context triggers a capture. Mote
+The router requests screen context when needed. A second check catches explicit
+references such as “on my screen” even if the classifier misses the image flag.
+Supplied error/code text and screenshot how-to questions do not force capture. Mote
 captures the **monitor containing the cursor at submission**, briefly makes its
 own window transparent, then restores its opacity and following. Image data is
 encoded in memory, resized to at most 1600px on its longest side, sent to the
@@ -78,16 +82,25 @@ and [chat API](https://docs.ollama.com/api/chat).
 
 Only the router's declared names and schema-validated arguments are accepted.
 The executor validates them again before acting. It never runs model-generated
-shell commands, Python code, arbitrary executables, or command-line arguments.
+shell commands, Python code, or model-supplied executable paths/arguments.
+A fixed PowerShell discovery script reads installed app names; user text is never
+interpolated into that script.
 
 | Command | Available behavior |
 | --- | --- |
-| `open_application` | Notepad, Calculator, Chrome, Edge, File Explorer, Settings, Spotify; apps must be installed. |
-| `open_website` | Open an HTTP/HTTPS URL in the default browser; other schemes and credentials are rejected. |
+| `open_application` | Any discoverable installed app by name, using Start-menu shortcuts, Windows app IDs, and registry App Paths. Ambiguous names require clarification; portable apps need registration or a Start-menu shortcut. |
+| `open_website` | Open any HTTP/HTTPS domain or URL in the default browser, including paths and queries. Common names such as YouTube are recognized. Unknown brand names require a full domain; other schemes and credentials are rejected. |
 | `open_windows_settings` | Display, sound, Bluetooth, network, Wi-Fi, privacy, accessibility, Windows Update. |
 | `copy_text` | Copy the supplied text to the Windows clipboard. |
 | `press_hotkey` | Ctrl+C/V/Z/A/S, Alt+Tab/F4, Win+D/E; **requires explicit confirmation**, default Cancel. |
-| `set_volume`, `adjust_volume` | Not integrated; Mote explains this and suggests opening sound settings. |
+| `set_volume`, `adjust_volume` | Windows default audio output: set 0–100%, raise/lower by 5 percentage points, mute/unmute. Setting a positive volume or raising it also unmutes. |
+
+Command plans run in the requested order. All command schemas and app lookups
+are checked before the first action. If an action fails or a shortcut is declined,
+remaining actions stop and the result reports earlier successes. Actions already
+completed are not rolled back. A launch means Windows accepted an open request;
+it does not wait for the app/site to finish loading. Conditional workflows and
+requests combining unsupported actions are answered for clarification.
 
 Keyboard shortcuts target the application recorded before Mote opened. The
 confirmation names that window. After approval, Mote restores and verifies that
@@ -107,13 +120,45 @@ Set variables before launching Mote; restart after changing them.
 | `MOTE_ROUTER_MODEL` | `gemma4:e2b` | Structured decision model; no separate FunctionGemma checkpoint is used. |
 | `MOTE_OLLAMA_HOST` | `http://localhost:11434` | Existing Ollama endpoint, shared by router and answers. |
 | `MOTE_TIMEOUT` | `60` | Request/read timeout in seconds, positive and finite. |
+| `MOTE_CONTEXT_LENGTH` | `8192` | Shared router/answer context size; 2048–131072. Smaller contexts reduce memory but can reject/truncate long requests. |
+| `MOTE_GPU_LAYERS` | `auto` | Let Ollama choose GPU offload. Optional integer `num_gpu` override; `0` selects CPU, `999` requests all layers. Hardware/runtime support and enough memory are still required. |
+| `MOTE_KEEP_ALIVE` | `30m` | Ollama residency duration. `-1` keeps the model loaded until Ollama evicts/stops it; `0` unloads after use. |
 
 By default routing and answers use the same model with a 30-minute keep-alive,
 without duplicate model instances or loading at startup. Choosing different
 models may increase memory use and latency. Use local models and the local
 endpoint to keep prompts and screenshots on your machine.
 
-## Linux preview and automated tests
+## Router speed, preloading, and VRAM
+
+Complete commands such as “open YouTube and set the volume to 50” skip model
+inference entirely. Other requests use a compact structured router prompt with
+thinking disabled. Automatic GPU offload is explicitly requested (`num_gpu=-1`).
+Routing and answering share context/GPU settings so switching
+between them does not request a different runner configuration. The application
+does not download models or require inference for supported explicit commands.
+
+Use native Ollama on Windows with supported GPU drivers. Ollama automatically
+places models on GPU where possible; an oversized model/context can spill to CPU
+and system RAM. Keeping a model loaded does not itself force GPU residency.
+See [Ollama hardware support](https://docs.ollama.com/gpu) and
+[residency/context guidance](https://docs.ollama.com/faq).
+
+Preload the configured model(s), check vision support, and inspect the actual
+GPU residency reported by `/api/ps`:
+
+```powershell
+.venv\Scripts\python.exe scripts/model_status.py --warmup
+ollama ps
+```
+
+The diagnostic prints `gpu_percent`, `vram_bytes`, model capabilities, context
+settings, and keep-alive. `100% GPU` in `ollama ps` confirms full placement. If
+placement is mixed, close other GPU workloads or use a smaller model/context.
+Leave `MOTE_GPU_LAYERS=auto` initially; forcing layers beyond available memory
+can fail. Apple Silicon uses unified memory, so it cannot verify Windows VRAM.
+
+## Preview and automated tests
 
 Install the same dependencies in a virtual environment, then run:
 
@@ -134,6 +179,27 @@ tests use the offscreen platform. Offscreen warnings about opacity/raising are
 expected; that backend has no window manager and cannot verify native focus,
 Acrylic, or real screen capture.
 
+Run a live router-only evaluation (no desktop commands or screenshots execute):
+
+```powershell
+.venv\Scripts\python.exe scripts/evaluate_router.py --output router-results.json
+.venv\Scripts\python.exe scripts/evaluate_router.py --model-only --output classifier-results.json
+```
+
+Each case prints pass/fail and latency; the JSON contains the complete decisions.
+The first command measures deployed routing including fast paths. `--model-only`
+disables command fast paths to exercise Ollama on every case. This requires the
+configured router model to be installed and Ollama running. Mocked tests establish
+code behavior, not the accuracy of an installed model.
+
+See [TEST_FINDINGS.md](TEST_FINDINGS.md) for the baseline, each test iteration,
+measured fast-path timings, and platform limitations.
+
+The answer model receives Mote's identity, tool registry, platform availability,
+vision support, current screenshot state, memory limits, and unsupported features
+on every answer. It can describe app tools without pretending this answer stage
+can execute them or that it can see a screen without an attached image.
+
 ## Manual Windows verification
 
 1. Start Ollama and Mote. Focus Notepad, then invoke Ctrl+Shift+Space. Verify
@@ -146,8 +212,13 @@ Acrylic, or real screen capture.
    second monitor. Invoke and ask about the screen with the pointer on that
    monitor. Verify capture status, correct monitor content, exclusion of Mote,
    restored opacity, and a real visual answer. Check that no image file appears.
-4. Ask to open Notepad, a website, and Wi-Fi settings; verify each target. Ask
-   to copy a short supplied string, then paste it manually into Notepad.
+4. Ask to open Notepad, an app outside the old list (Firefox/VS Code/Word),
+   a Store app, an arbitrary domain/path, and Wi-Fi settings. Verify each target.
+   Try an ambiguous app name and an uninstalled app. Copy supplied text and paste
+   it manually. Request “open YouTube and set the volume to 50”; verify order,
+   browser launch, and the volume slider. Test mute/unmute and relative volume.
+   Confirm the popup remains responsive during initial app discovery. Ask “What
+   can you do?” and verify the answer describes the available tools accurately.
 5. In a disposable Notepad window, request a supported shortcut. Cancel once:
    nothing should happen. Approve once: the named target should receive it.
    Test Alt+F4 only in a disposable window. Close/change the target during
@@ -175,8 +246,13 @@ Acrylic, or real screen capture.
 
 ## Scope and limitations
 
-- Microphone input, file attachments, and volume control are not implemented.
-  Automatic screen routing replaces the old disabled screenshot placeholder.
+- Microphone input, file attachments, arbitrary shell commands, general mouse
+  automation, and automatic website reading/search are not implemented.
+- Installed apps must be discoverable through Windows registration or Start-menu
+  shortcuts. App discovery is cached for 60 seconds. Use the full app name if
+  several installed apps match.
+- Plans contain at most eight supported commands, execute sequentially, and stop
+  at the first failure/declined shortcut. They do not wait for app load completion.
 - The router accepts a 4KB request/context budget; long pasted requests may need
   shortening. Conversation memory is limited to six messages / 12K characters
   and disappears on exit. Images from prior turns are not reused.
@@ -194,7 +270,12 @@ Acrylic, or real screen capture.
 - `ai/pipeline.py`: router → answer/screenshot/command orchestration and bounded context.
 - `ai/worker.py`: Qt worker, cancellation, stale-update guards, safe shutdown.
 - `ai/gemma.py`: reusable Ollama client, capabilities, content-only streaming.
-- `router/router.py`: existing structured model router and declared command schemas.
+- `router/router.py`: structured router, command-plan validation, and declared schemas.
+- `router/intents.py`, `router/urls.py`: explicit-command fast paths, screen checks, URL normalization.
+- `ai/capabilities.py`: answer-model identity and session-aware capability instructions.
+- `ai/runtime.py`, `ai/diagnostics.py`: shared model settings and GPU/vision diagnostics.
+- `integration/apps.py`, `integration/audio.py`: installed-app discovery and Core Audio volume.
+- `scripts/`: live router evaluation and optional model preloading/status.
 - `integration/desktop.py`: GUI-thread screenshot/clipboard/confirmation bridge.
 - `integration/actions.py`: validated Windows actions and verified keyboard targets.
 - `integration/hotkey.py`: existing native Windows hotkey registration.
