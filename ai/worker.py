@@ -7,6 +7,7 @@ from threading import Event
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from ai.pipeline import Cancelled, PipelineError, check_cancelled
+from services.attachments import AssistantRequest, AttachmentError, prepare_request
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class RequestWorker(QThread):
     completed = Signal(int, object)
     failed = Signal(int, str)
     desktop_requested = Signal(int, object)
+    attachments_captured = Signal(int, object)
 
     def __init__(self, pipeline, request_id, prompt, history, context, parent):
         super().__init__(parent)
@@ -62,8 +64,16 @@ class RequestWorker(QThread):
 
     def run(self):
         try:
+            prompt = self.prompt
+            if isinstance(prompt, AssistantRequest):
+                self.status.emit(self.request_id, "Reading attachments…")
+                prompt = prepare_request(prompt, lambda: check_cancelled(self.cancel_event))
+                self.attachments_captured.emit(self.request_id, {
+                    "ids": tuple(a.id for a in prompt.attachments),
+                    "truncated": tuple(a.name for a in prompt.attachments if a.truncated),
+                })
             result = self.pipeline.run(
-                self.prompt, history=self.history, cancel=self.cancel_event,
+                prompt, history=self.history, cancel=self.cancel_event,
                 status=lambda text: self.status.emit(self.request_id, text),
                 partial=lambda text: self.partial.emit(self.request_id, text),
                 desktop=self._desktop,
@@ -72,7 +82,7 @@ class RequestWorker(QThread):
             self.completed.emit(self.request_id, result)
         except Cancelled:
             pass
-        except PipelineError as error:
+        except (PipelineError, AttachmentError) as error:
             self.failed.emit(self.request_id, str(error))
         except Exception as error:
             logger.exception("Unexpected Mote worker failure")
@@ -85,6 +95,7 @@ class PipelineController(QObject):
     completed = Signal(int, str)
     failed = Signal(int, str)
     desktop_requested = Signal(int, object)
+    attachments_captured = Signal(int, object)
     stopped = Signal()
 
     def __init__(self, pipeline, parent=None):
@@ -122,6 +133,7 @@ class PipelineController(QObject):
         worker.completed.connect(self._completed)
         worker.failed.connect(self._failed)
         worker.desktop_requested.connect(self._desktop)
+        worker.attachments_captured.connect(self._captured)
         worker.finished.connect(self._retire)
         worker.start()
 
@@ -145,6 +157,11 @@ class PipelineController(QObject):
     def _failed(self, request_id, text):
         if request_id == self.active_id:
             self.failed.emit(request_id, text)
+
+    @Slot(int, object)
+    def _captured(self, request_id, attachments):
+        if request_id == self.active_id:
+            self.attachments_captured.emit(request_id, attachments)
 
     @Slot(int, object)
     def _desktop(self, request_id, call):
