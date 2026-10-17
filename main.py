@@ -11,7 +11,7 @@ from ui.popup import AssistantPopup
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Mote interaction prototype")
-    parser.add_argument("--preview", action="store_true", help="Open UI without a global hotkey")
+    parser.add_argument("--preview", action="store_true", help="Open UI without registering the global opening hotkey")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Mote")
@@ -22,13 +22,13 @@ def main() -> int:
         popup.open_at_cursor()
     else:
         try:
-            hotkey = WindowsHotkey(popup.open_at_cursor)
+            hotkey = WindowsHotkey(popup.toggle_at_cursor)
             hotkey.start(app)
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(None, "Mote could not start", str(error))
             return 1
         app.aboutToQuit.connect(hotkey.stop)
-        print("Mote ready: Ctrl+Shift+Space opens the popup. Use Quit to exit.", flush=True)
+        print("Mote ready: Ctrl+Shift+Space toggles; Esc dismisses; Ctrl+Q quits when focused.", flush=True)
 
     return app.exec()
 
