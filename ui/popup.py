@@ -54,6 +54,7 @@ from ai.worker import PipelineController
 from integration.desktop import DesktopIntegration
 from services.attachments import AssistantRequest, select_attachments
 from services.tts import SpeechService
+from services.stt import VoiceService
 
 
 def _motion_enabled() -> bool:
@@ -176,6 +177,45 @@ class _ThinkingIndicator(QWidget):
         painter.drawText(QRect(46, 0, max(0, self.width() - 46), 40), Qt.AlignmentFlag.AlignVCenter, self.text)
 
 
+class _MicrophoneButton(QPushButton):
+    def __init__(self):
+        super().__init__("\ue720")
+        self.setFont(QFont("Segoe MDL2 Assets", 12))
+        self.setFixedSize(32, 32)
+        self.level = 0.0
+        self.tint = (195, 130, 142)
+        self.pulse = QVariantAnimation(self)
+        self.pulse.setStartValue(0.0)
+        self.pulse.setEndValue(2 * math.pi)
+        self.pulse.setDuration(1400)
+        self.pulse.setLoopCount(-1)
+        self.pulse.valueChanged.connect(self._tick)
+
+    def _tick(self, value):
+        self.level = 0.5 + 0.5 * math.sin(value)
+        self.update()
+
+    def set_activity(self, active, listening, motion):
+        self.tint = (195, 130, 142) if listening else (160, 196, 230)
+        if active and motion:
+            if self.pulse.state() != QVariantAnimation.State.Running:
+                self.pulse.start()
+        else:
+            self.pulse.stop()
+            self.level = 0.5 if active else 0.0
+        self.setProperty("voiceActive", active)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.property("voiceActive"):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(*self.tint, round(20 + 22 * self.level)))
+            painter.drawRoundedRect(QRectF(self.rect()), 10, 10)
+
+
 class _CopyButton(QPushButton):
     """Draw a small copy/check icon consistently, including in Linux preview."""
 
@@ -217,10 +257,29 @@ class _ResponsePanel(QPlainTextEdit):
         # and scrollbar. The editor itself retains its existing glass/shadow.
         self.setViewportMargins(0, self.ACTION_HEIGHT, 0, 0)
         self.copy_button = _CopyButton(self)
+        self.action_bar = None
+        self.viewport().installEventFilter(self)
+
+    def set_action_bar(self, bar):
+        self.action_bar = bar
+        self._position_actions()
+
+    def _position_actions(self):
+        self.copy_button.move(max(0, self.viewport().geometry().right() + 1 - self.copy_button.width()), 8)
+        if self.action_bar is not None:
+            # Reserve the copy button's real hit area, including when a scrollbar
+            # narrows the viewport. Transparent labels still intercept clicks.
+            self.action_bar.setGeometry(16, 8, max(0, self.copy_button.x() - 24), self.ACTION_HEIGHT)
+        self.copy_button.raise_()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.copy_button.move(max(0, self.viewport().geometry().right() + 1 - self.copy_button.width()), 8)
+        self._position_actions()
+
+    def eventFilter(self, watched, event):
+        if watched is self.viewport() and event.type() == QEvent.Type.Resize:
+            self._position_actions()
+        return super().eventFilter(watched, event)
 
 
 class AssistantPopup(QWidget):
@@ -238,7 +297,7 @@ class AssistantPopup(QWidget):
     SIDE_SWITCH_MARGIN = 48
     FOLLOW_DEADBAND = 2
 
-    def __init__(self, *, pipeline=None, speech=None) -> None:
+    def __init__(self, *, pipeline=None, speech=None, voice=None) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Mote")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -255,6 +314,22 @@ class AssistantPopup(QWidget):
         self._file_dialog_open = False
         self._spoken_text = ""
         self.speech = speech or SpeechService(self)
+        self.voice = voice or VoiceService(self)
+        self._voice_error_message = ""
+        self._voice_span = None
+        self._voice_document = ""
+        self._voice_detached = False
+        self._updating_voice = False
+        self._quitting = False
+        self._quit_sent = False
+        self._pipeline_stopped = False
+        self.voice.status_changed.connect(self._voice_status)
+        self.voice.transcript.connect(self._insert_transcript)
+        self.voice.draft.connect(self._update_voice_draft)
+        self.voice.cancelled.connect(self._discard_voice_draft)
+        self.voice.failed.connect(self._voice_failed)
+        self.voice.stopped.connect(self._maybe_quit)
+        QApplication.instance().aboutToQuit.connect(self.voice.shutdown)
         self.speech.speaking_changed.connect(self._speech_state)
         self.speech.failed.connect(self._speech_failed)
         QApplication.instance().aboutToQuit.connect(self.speech.shutdown)
@@ -308,7 +383,7 @@ class AssistantPopup(QWidget):
         self.controller.failed.connect(self._pipeline_failed)
         self.controller.desktop_requested.connect(self.desktop.handle)
         self.controller.attachments_captured.connect(self._attachments_captured)
-        self.controller.stopped.connect(QApplication.instance().quit)
+        self.controller.stopped.connect(self._pipeline_shutdown_finished)
         QApplication.instance().aboutToQuit.connect(self.controller.shutdown)
         self.backdrop_status = "Translucent fallback (native backdrop not initialized)"
         self._backdrop_timer = QTimer(self)
@@ -397,19 +472,18 @@ class AssistantPopup(QWidget):
         self.prompt.setAccessibleName("Ask Mote anything")
         self.prompt.setToolTip("Enter to send · Ask about your screen for automatic capture · Esc to hide · Ctrl+Q to quit")
         self.prompt.returnPressed.connect(self.submit)
+        self.prompt.textChanged.connect(self._voice_input_changed)
         entry = QVBoxLayout(self.input_bar)
         entry.setContentsMargins(20, 10, 20, 12)
         entry.setSpacing(6)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
-        for glyph, name in (("\ue720", "Microphone"),):
-            button = QPushButton(glyph)
-            button.setFont(QFont("Segoe MDL2 Assets", 12))
-            button.setFixedSize(32, 32)
-            button.setAccessibleName(name)
-            button.setToolTip(f"{name} (coming soon)")
-            button.setEnabled(False)
-            toolbar.addWidget(button)
+        self.mic_button = _MicrophoneButton()
+        self.mic_button.setAccessibleName("Start voice input")
+        self.mic_button.setToolTip("Start voice input (local Whisper; first use downloads the model)")
+        self.mic_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mic_button.clicked.connect(self._toggle_microphone)
+        toolbar.addWidget(self.mic_button)
         self.attach_button = QPushButton("\ue723")  # Attach
         self.attach_button.setFont(QFont("Segoe MDL2 Assets", 12))
         self.attach_button.setFixedSize(32, 32)
@@ -427,7 +501,11 @@ class AssistantPopup(QWidget):
         self.follow_button.setToolTip("Disable cursor following")
         self.follow_button.toggled.connect(self._set_follow_enabled)
         toolbar.addWidget(self.follow_button)
-        toolbar.addStretch()
+        self.voice_notice = QLabel()
+        self.voice_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.voice_notice.setFont(QFont("Segoe UI", 9))
+        self.voice_notice.setMaximumWidth(160)
+        toolbar.addWidget(self.voice_notice, 1)
         self.send_button = _SendButton(self)
         self.send_button.setObjectName("sendButton")
         self.send_button.setFixedHeight(32)
@@ -471,26 +549,37 @@ class AssistantPopup(QWidget):
         self.response_notice = QLabel()
         self.response_notice.setTextFormat(Qt.TextFormat.PlainText)
         self.response_notice.setFont(QFont("Segoe UI", 9))
-        actions.addWidget(self.response_notice, 1)
         self.speaker_button = QPushButton("\ue767")  # Volume
         self.speaker_button.setObjectName("speakerButton")
         self.speaker_button.setFont(QFont("Segoe MDL2 Assets", 11))
-        self.speaker_button.setFixedSize(28, 26)
+        self.speaker_button.setFixedSize(28, 28)
         self.speaker_button.setCheckable(True)
         self.speaker_button.setEnabled(False)
         self.speaker_button.setAccessibleName("Read aloud")
         self.speaker_button.setToolTip("Read aloud")
         self.speaker_button.clicked.connect(self._toggle_speech)
         actions.addWidget(self.speaker_button)
-        self.response.installEventFilter(self)
+        actions.addWidget(self.response_notice, 1)
+        self.copy_notice = QLabel()
+        self.copy_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.copy_notice.setFont(QFont("Segoe UI", 9))
+        self.copy_notice.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        actions.addWidget(self.copy_notice)
+        self.response.set_action_bar(self.response_actions)
         self.copy_button = self.response.copy_button
         self.copy_button.setEnabled(False)
         self.copy_button.clicked.connect(self._copy_response)
         self._copy_available = False
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
-        self._copy_timer.setInterval(1400)
+        self._copy_timer.setInterval(2200)
         self._copy_timer.timeout.connect(self._reset_copy_feedback)
+        self._clipboard_retry = QTimer(self)
+        self._clipboard_retry.setSingleShot(True)
+        self._clipboard_retry.setInterval(40)
+        self._clipboard_retry.timeout.connect(self._write_clipboard)
+        self._copy_payload = None
+        self._copy_attempts = 0
         self.response.textChanged.connect(self._response_text_changed)
         self.thinking = _ThinkingIndicator(self.response.viewport())
         self._reveal_text(1.0)
@@ -514,7 +603,7 @@ class AssistantPopup(QWidget):
         self.resize(self.WIDTH + 2 * self.SHADOW_MARGIN, self.INPUT_HEIGHT + 2 * self.SHADOW_MARGIN)
 
         self.escape = QShortcut(QKeySequence("Escape"), self)
-        self.escape.activated.connect(self.dismiss)
+        self.escape.activated.connect(self._escape_pressed)
         self.quit_shortcut = QShortcut(self)
         self.quit_shortcut.setKey(QKeySequence("Ctrl+Q"))
         self.quit_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
@@ -534,11 +623,6 @@ class AssistantPopup(QWidget):
             self._backdrop_timer.start(0)
         return result
 
-    def eventFilter(self, watched, event):
-        if watched is self.response and event.type() == QEvent.Type.Resize:
-            self.response_actions.setGeometry(16, 4, max(0, event.size().width() - 32), 26)
-        return super().eventFilter(watched, event)
-
     def _speech_state(self, speaking):
         self.speaker_button.setChecked(speaking)
         action = "Stop reading" if speaking else "Read aloud"
@@ -546,10 +630,127 @@ class AssistantPopup(QWidget):
         self.speaker_button.setAccessibleName(action)
 
     def _toggle_speech(self):
+        if self.voice.busy:
+            return
         self.speech.toggle(self._spoken_text)
         # A checkable button toggles before clicked; failed engine startup must
         # not leave it highlighted as though playback had started.
         self.speaker_button.setChecked(self.speech.speaking)
+
+    def _toggle_microphone(self):
+        if self._quitting:
+            return
+        self._pause_following()
+        if not self.voice.busy:
+            self.speech.stop()
+            self._voice_error_message = ""
+            self._voice_span = None
+            self._voice_detached = False
+        self.voice.toggle()
+
+    def _voice_status(self, text):
+        listening = self.voice.recording
+        active = self.voice.active
+        self.mic_button.set_activity(active, listening, self.motion_enabled)
+        self.mic_button.setEnabled(not self._quitting and (active or not self.voice.busy))
+        tip = ("Stop recording and finalize transcript" if listening else "Cancel voice input") if active else "Start voice input"
+        self.mic_button.setToolTip(tip)
+        self.mic_button.setAccessibleName(tip)
+        self.voice_notice.setText(self.voice_notice.fontMetrics().elidedText(
+            self._voice_error_message or ("" if text == "Idle" else text), Qt.TextElideMode.ElideRight, 155,
+        ))
+        self.voice_notice.setToolTip(self._voice_error_message or text)
+        self.speaker_button.setEnabled(bool(self._spoken_text) and not self.voice.busy and not self._quitting)
+
+    def _voice_failed(self, message):
+        self._voice_span = None  # Preserve any usable draft on a recognition error.
+        self._voice_error_message = message
+        self.voice_notice.setText("Voice input unavailable")
+        self.voice_notice.setToolTip(message)
+
+    def _insert_transcript(self, text):
+        self._update_voice_draft(text)
+        self._voice_span = None
+        if self.isVisible() and self.state != PopupState.CLOSING and not self._quitting:
+            self._focus_prompt()
+
+    def _update_voice_draft(self, text):
+        if not self.isVisible() or self.state == PopupState.CLOSING or self._quitting:
+            return
+        text = text.strip()
+        if not text or self._voice_detached:
+            return
+        original = self.prompt.text()
+        caret = len(original.encode("utf-16-le")[:self.prompt.cursorPosition() * 2].decode("utf-16-le"))
+        start, end = self._voice_span if self._voice_span is not None else (caret, caret)
+        prefix = " " if start and not original[start - 1].isspace() else ""
+        suffix = " " if end < len(original) and not original[end].isspace() else ""
+        replacement = prefix + text + suffix
+        qt_start = len(original[:start].encode("utf-16-le")) // 2
+        qt_length = len(original[start:end].encode("utf-16-le")) // 2
+        self._updating_voice = True
+        try:
+            self.prompt.setSelection(qt_start, qt_length)
+            self.prompt.insert(replacement)
+            # Keep a caret used to edit elsewhere from jumping to the voice text.
+            if caret < start or caret > end:
+                adjusted = caret + (len(replacement) - (end - start) if caret > end else 0)
+                current = self.prompt.text()
+                self.prompt.setCursorPosition(len(current[:adjusted].encode("utf-16-le")) // 2)
+        finally:
+            self._updating_voice = False
+        self._voice_span = (start, start + len(replacement))
+        self._voice_document = self.prompt.text()
+
+    def _voice_input_changed(self, current):
+        if self._updating_voice or self._voice_span is None:
+            return
+        before = self._voice_document
+        left = 0
+        while left < min(len(before), len(current)) and before[left] == current[left]:
+            left += 1
+        right = 0
+        while right < min(len(before), len(current)) - left and before[-1 - right] == current[-1 - right]:
+            right += 1
+        changed_end = len(before) - right
+        start, end = self._voice_span
+        if changed_end <= start:
+            delta = len(current) - len(before)
+            self._voice_span = (start + delta, end + delta)
+        elif left < end:
+            # Respect edits inside the provisional transcript. Stop replacing
+            # that span; the user can finish editing and submit it themselves.
+            self._voice_span = None
+            self._voice_detached = True
+        self._voice_document = current
+
+    def _discard_voice_draft(self):
+        if self._voice_span is not None:
+            start, end = self._voice_span
+            text = self.prompt.text()
+            self._updating_voice = True
+            try:
+                self.prompt.setSelection(len(text[:start].encode("utf-16-le")) // 2,
+                                         len(text[start:end].encode("utf-16-le")) // 2)
+                self.prompt.insert("")
+            finally:
+                self._updating_voice = False
+        self._voice_span = None
+
+    def _escape_pressed(self):
+        if self.voice.active:
+            self.voice.cancel()
+        else:
+            self.dismiss()
+
+    def _pipeline_shutdown_finished(self):
+        self._pipeline_stopped = True
+        self._maybe_quit()
+
+    def _maybe_quit(self):
+        if self._quitting and self._pipeline_stopped and not self.voice.busy and not self._quit_sent:
+            self._quit_sent = True
+            QApplication.instance().quit()
 
     def _speech_failed(self, message):
         self.response_notice.setText("Speech unavailable")
@@ -930,6 +1131,7 @@ class AssistantPopup(QWidget):
     def dismiss(self) -> None:
         if not self.isVisible() or self.state == PopupState.CLOSING:
             return
+        self.voice.cancel()
         self._stop_following()
         self._cancel_response()
         self._window_transition.stop()
@@ -941,6 +1143,8 @@ class AssistantPopup(QWidget):
     def hideEvent(self, event) -> None:
         # Also clean up if a caller hides the widget without using dismiss().
         if hasattr(self, "_window_transition"):
+            self.voice.cancel()
+            self.mic_button.set_activity(False, False, False)
             self._stop_following()
             self._window_transition.stop()
             self._expansion.stop()
@@ -972,7 +1176,10 @@ class AssistantPopup(QWidget):
 
     def _reset_copy_feedback(self) -> None:
         self._copy_timer.stop()
+        self._clipboard_retry.stop()
+        self._copy_payload = None
         self.copy_button.set_copied(False)
+        self.copy_notice.clear()
 
     def _response_text_changed(self) -> None:
         self._reset_copy_feedback()
@@ -983,11 +1190,42 @@ class AssistantPopup(QWidget):
             return
         text = self.response.toPlainText()
         if text.strip():
-            QApplication.clipboard().setText(text)
+            self._reset_copy_feedback()
+            self._copy_payload = text
+            self._copy_attempts = 0
+            self._write_clipboard()
+
+    def _write_clipboard(self) -> None:
+        text = self._copy_payload
+        if text is None or text != self.response.toPlainText():
+            return
+        self._copy_attempts += 1
+        try:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            copied = clipboard.text() == text
+        except (RuntimeError, OSError):
+            copied = False
+        if copied:
             self.copy_button.set_copied(True)
+            self.copy_notice.setText("Copied")
+            self.copy_notice.setStyleSheet("color: #a8ceb4;")
+            self.copy_notice.setToolTip("Response copied to clipboard")
+            self._copy_payload = None
+            self._copy_timer.start()
+        elif self._copy_attempts < 3:
+            self._clipboard_retry.start()
+        else:
+            self.copy_notice.setText("Copy failed")
+            self.copy_notice.setStyleSheet("color: #dbb788;")
+            self.copy_notice.setToolTip("The clipboard is busy or unavailable. Click Copy to try again.")
+            self._copy_payload = None
             self._copy_timer.start()
 
     def _request_quit(self) -> None:
+        self._quitting = True
+        self.mic_button.setEnabled(False)
+        self.voice.request_stop()
         self._cancel_response()
         self._copy_available = False
         self.prompt.setEnabled(False)
@@ -1126,7 +1364,7 @@ class AssistantPopup(QWidget):
         if request_id != self._request_id:
             return
         self._spoken_text = text
-        self.speaker_button.setEnabled(bool(text.strip()))
+        self.speaker_button.setEnabled(bool(text.strip()) and not self.voice.busy)
         if not self._attachment_notice and not self._screenshot_attached:
             self.response_notice.clear()
         # Commands have a single result rather than a model stream.
@@ -1175,6 +1413,10 @@ class AssistantPopup(QWidget):
         text = self.prompt.text().strip()
         if not text or self.state in (PopupState.CLOSED, PopupState.CLOSING):
             return
+        # Enter explicitly accepts the current draft; cancellation must not
+        # remove the text the user has just chosen to send.
+        self._voice_span = None
+        self.voice.cancel()
         self._cancel_response()
         self._spoken_text = ""
         self.speaker_button.setEnabled(False)

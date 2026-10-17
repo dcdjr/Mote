@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -13,6 +14,16 @@ from PySide6.QtWidgets import QApplication
 
 from ai.pipeline import Result
 from ui.popup import AssistantPopup, PopupState
+
+
+@contextmanager
+def mock_clipboard():
+    with patch('ui.popup.QApplication.clipboard') as clipboard:
+        clipboard.return_value.text.return_value = ''
+        def set_text(text):
+            clipboard.return_value.text.return_value = text
+        clipboard.return_value.setText.side_effect = set_text
+        yield clipboard
 
 
 class InteractionPipeline:
@@ -320,21 +331,23 @@ class FollowTests(unittest.TestCase):
         self.finish_response('The displayed answer.\nOnly this text.', streamed=True)
         self.assertTrue(p.copy_button.isEnabled())
         self.assertEqual(p.copy_button.accessibleName(), 'Copy response')
-        with patch('ui.popup.QApplication.clipboard') as clipboard:
+        with mock_clipboard() as clipboard:
             p.copy_button.click()
             clipboard.return_value.setText.assert_called_once_with('The displayed answer.\nOnly this text.')
         self.assertTrue(p.copy_button.copied)
         self.assertEqual(p.copy_button.toolTip(), 'Copied')
+        self.assertEqual(p.copy_notice.text(), 'Copied')
         p._copy_timer.setInterval(10)
         p._copy_timer.start()
         QTest.qWait(30)
         self.assertFalse(p.copy_button.copied)
+        self.assertEqual(p.copy_notice.text(), '')
         self.assertEqual(p.copy_button.toolTip(), 'Copy response')
 
     def test_copy_tool_result_and_reset_for_new_response(self):
         p = self.popup
         self.finish_response('Asked Windows to open notepad.')
-        with patch('ui.popup.QApplication.clipboard') as clipboard:
+        with mock_clipboard() as clipboard:
             p.copy_button.click()
             self.assertTrue(p.copy_button.copied)
             p.prompt.setText('A new request')
@@ -370,11 +383,51 @@ class FollowTests(unittest.TestCase):
         self.assertFalse(p.copy_button.geometry().intersects(p.response.viewport().geometry()))
         scrollbar_rect = QRect(scrollbar.mapTo(p.response, QPoint()), scrollbar.size())
         self.assertFalse(p.copy_button.geometry().intersects(scrollbar_rect))
-        with patch('ui.popup.QApplication.clipboard') as clipboard:
+        with mock_clipboard() as clipboard:
             p.copy_button.click()
             clipboard.return_value.setText.assert_called_once_with(text)
         self.assertEqual(p.response.textCursor().selectedText(), selected)
         self.assertEqual(scrollbar.value(), scroll_position)
+
+    def test_copy_receives_pointer_click_without_header_overlay(self):
+        p = self.popup
+        self.finish_response('Copy this complete answer.', streamed=True)
+        self.app.processEvents()
+        point = p.copy_button.mapTo(p, p.copy_button.rect().center())
+        self.assertIs(p.childAt(point), p.copy_button)
+        with mock_clipboard() as clipboard:
+            QTest.mouseClick(p.windowHandle(), Qt.MouseButton.LeftButton, pos=point)
+            clipboard.return_value.setText.assert_called_once_with('Copy this complete answer.')
+        self.assertTrue(p.copy_button.copied)
+
+    def test_copy_retries_busy_clipboard_and_confirms_success(self):
+        p = self.popup
+        self.finish_response('Clipboard retry test')
+        with patch('ui.popup.QApplication.clipboard') as clipboard:
+            clipboard.return_value.text.side_effect = ['', 'Clipboard retry test']
+            p.copy_button.click()
+            self.assertFalse(p.copy_button.copied)
+            QTest.qWait(100)
+            self.assertEqual(clipboard.return_value.setText.call_count, 2)
+            self.assertEqual(p.copy_notice.text(), 'Copied')
+            self.assertTrue(p.copy_button.copied)
+
+    def test_copy_failure_is_visible_and_retry_stops_when_response_changes(self):
+        p = self.popup
+        self.finish_response('Clipboard unavailable test')
+        with patch('ui.popup.QApplication.clipboard') as clipboard:
+            clipboard.return_value.text.return_value = ''
+            p.copy_button.click()
+            QTest.qWait(150)
+            self.assertEqual(clipboard.return_value.setText.call_count, 3)
+            self.assertFalse(p.copy_button.copied)
+            self.assertEqual(p.copy_notice.text(), 'Copy failed')
+            p.copy_button.click()
+            p.response.clear()
+            attempts = clipboard.return_value.setText.call_count
+            QTest.qWait(100)
+            self.assertEqual(clipboard.return_value.setText.call_count, attempts)
+            self.assertEqual(p.copy_notice.text(), '')
 
     def test_opening_hotkey_toggles_and_escape_dismisses(self):
         p = self.popup

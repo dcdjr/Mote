@@ -1,4 +1,8 @@
 PySide6>=6.7,<7
 ollama>=0.6,<1
 pypdf>=6,<7
+faster-whisper>=1.2,<2
+sounddevice>=0.5,<1
+# faster-whisper 1.2 uses PyAV's metadata_errors API (removed in newer releases).
+av>=15,<17
 pycaw>=20251023; sys_platform == "win32"
