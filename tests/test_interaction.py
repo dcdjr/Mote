@@ -344,7 +344,13 @@ class FollowTests(unittest.TestCase):
             self.assertFalse(p._copy_timer.isActive())
             p._pipeline_partial(100, 'A stale response')
             self.assertFalse(p.copy_button.isEnabled())
-            QTest.qWait(100)
+            # Worker completion is asynchronous; a fixed 100ms misses queued
+            # signals on slower/offscreen Qt backends.
+            for _ in range(200):
+                self.app.processEvents()
+                if p.copy_button.isEnabled():
+                    break
+                QTest.qWait(10)
             self.assertTrue(p.copy_button.isEnabled())
             p.copy_button.click()
             self.assertEqual(clipboard.return_value.setText.call_args.args[0], 'Test response: A new request')

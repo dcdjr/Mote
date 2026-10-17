@@ -79,7 +79,7 @@ class PipelineTests(unittest.TestCase):
         pipeline, client = make_pipeline('screen_reasoning')
         desktop = Mock(return_value=b'PNG in memory')
         status = []
-        result = pipeline.run('What is on my screen?', desktop=desktop, status=status.append)
+        result = pipeline.run('Diagnose the error on my screen', desktop=desktop, status=status.append)
         desktop.assert_called_once_with('screenshot', None)
         message = client.chat.call_args.kwargs['messages'][-1]
         self.assertEqual(message['images'], [b'PNG in memory'])

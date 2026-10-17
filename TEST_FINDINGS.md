@@ -98,3 +98,51 @@ application Paint.NET”. Launch success means Windows accepted a request, not t
 the application or website finished loading. General browser reading/search,
 mouse automation, arbitrary shell commands, microphone, and file attachments
 remain outside the implemented tool set.
+
+## Screenshot reliability follow-up
+
+The screenshot regressions reproduced three routing problems: capture still
+relied on classifier output, natural requests could be suppressed, and an
+incorrect command route could bypass capture. The current attachment pipeline
+also no longer called the capability instructions describing actual screen
+access. Those instructions have been restored without dropping attachment-data
+boundaries.
+
+Explicit capture and current-screen requests now use a deterministic screen
+route before classifier inference, with a pipeline check as well. Fresh captures
+can accompany existing image/text attachments. Pasted code and literal copy
+payloads cannot request capture. Explicit capture opt-outs are respected even
+if the model incorrectly selects a screen handler. Empty capture data fails
+instead of reaching the answer model without an image. A persistent Screenshot
+attached indicator confirms that capture data reached the request.
+
+Windows capture now applies WDA_EXCLUDEFROMCAPTURE when supported, makes visible
+Mote windows (including auxiliary menus/dialogs) transparent, waits 150ms, and
+flushes DWM before reading pixels. Original opacity and affinity are restored
+on success, failure, and cancellation. Qt hide() is avoided because it cancels
+the active request. Windows-native pixel results still require a Windows check.
+
+Validation:
+
+- New screenshot regression baseline: six test methods reproduced failures,
+  including multiple explicit-request subcases.
+- After routing fixes: all six passed.
+- First full suite: 120 tests, two failures. A screenshot reasoning expectation
+  was updated to explicitly request diagnosis; a copy-button test was waiting
+  a fixed 100ms for asynchronous completion.
+- Second full suite: 125 tests, only the copy-button timing test failed. Changed
+  that test to a bounded wait for completion; no copy behavior was changed.
+- Third full suite: 127/127 passed, including literal-payload and empty-image
+  regressions.
+- Final full suite: **129/129 passed** in about 5.3 seconds, including auxiliary
+  Mote-window exclusion and explicit capture opt-out checks.
+- Python compilation and git diff whitespace checks passed.
+- Live image-path test used the existing Gemma instance on **127.0.0.1:11435**.
+  An in-memory synthetic screenshot contained CODE: 6832. The real pipeline
+  called its capture callback exactly once, attached the image, and Gemma
+  answered **6832**. No real desktop screenshot or Windows action occurred.
+
+Restart Mote after updating and ask “Take a screenshot and describe my screen.”
+Look for Screenshot attached under the response. Check a second monitor and
+verify that Mote's popup/menus are absent from the analyzed image. A vision-
+capable model remains required; unsupported vision produces a visible error.

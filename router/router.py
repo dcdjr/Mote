@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 
 from ai.runtime import keep_alive, model_options
-from router.intents import fast_selection, screen_needed
+from router.intents import fast_selection, screen_needed, screen_decision, screen_capture_forbidden
 from router.urls import normalize_url
 
 __all__ = ["COMMANDS", "MoteRouter", "RouterError"]
@@ -324,6 +324,8 @@ class MoteRouter:
             raise ValueError("context must contain JSON-serializable values.") from exc
         if len(content.encode("utf-8")) > 4096:
             raise ValueError("Request/context exceeds the router's 4 KB input budget.")
+        if self.fast_paths and screen_needed(query, context):
+            return screen_decision(query)
         fast = fast_selection(query) if self.fast_paths else None
         if fast is not None:
             return _parse_selection(json.dumps(fast))
@@ -351,8 +353,9 @@ class MoteRouter:
         if isinstance(tokens, int) and tokens + options["num_predict"] >= options["num_ctx"]:
             raise RouterError("The request reached the model context budget.", response_text=text)
         decision = _parse_selection(text, context["image_attached"])
-        if decision["route"] == "answer" and screen_needed(query, context):
-            decision["screenshot"] = True
-            if re.search(r"\b(error|debug|diagnose|troubleshoot|broken|crash)\b", query, re.I):
-                decision["reasoning"] = True
+        if screen_needed(query, context):
+            screen = screen_decision(query)
+            return {**screen, "reasoning": decision["reasoning"] or screen["reasoning"]}
+        if screen_capture_forbidden(query):
+            decision["screenshot"] = False
         return decision
