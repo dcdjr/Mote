@@ -3,17 +3,62 @@ import re
 from router.urls import normalize_url
 
 
-def screen_needed(query, context):
-    if re.match(r"\s*(?:how (?:do|can|should) (?:i|we|you) (?:take|capture|save) (?:a |the )?screenshot|what can you|do you|are you able|don't|do not)\b", query, re.I):
+def _screen_intent_text(query):
+    # Literal copy payloads, pasted code and error bodies cannot request a capture.
+    if re.match(r"\s*copy (?:this text|text)\s*:", query, re.I):
+        return ""
+    query = re.split(r"\b(?:error|code|text|traceback|message)\s*:", query, maxsplit=1, flags=re.I)[0]
+    return re.sub(r"```[\s\S]*?```|`[^`]*`", "", query)
+
+
+def explicit_screenshot_requested(query):
+    """An instruction to capture, rather than a tutorial or general capability question."""
+    query = _screen_intent_text(query)
+    if _screen_opt_out(query) or _screen_howto(query):
         return False
-    if context.get('image_attached'):
+    return bool(re.search(
+        r"\b(?:take|grab|snap|capture|attach|send|use)\s+(?:(?:a|an|the|new|fresh|another|current|my)\s+){0,4}(?:screen\s*shot|screen\s*capture)\b|"
+        r"^\s*(?:please\s+)?screenshot(?:\s+(?:my|the|this)\s+(?:screen|desktop|display))?[.!?]*\s*$|"
+        r"\b(?:capture|grab)\s+(?:(?:my|the|this|current)\s+){0,2}(?:screen|desktop|display|monitor)\b", query, re.I))
+
+
+def _screen_opt_out(query):
+    return bool(re.search(
+        r"\b(?:don't|do not|never)\s+(?:take|grab|capture|use|attach)\s+(?:(?:a|the|my|new)\s+){0,3}(?:screenshot|screen)|"
+        r"\bwithout\s+(?:(?:taking|a|the|using|capturing|my)\s+){0,3}(?:screenshot|screen)", query, re.I))
+
+
+def _screen_howto(query):
+    return bool(re.match(
+        r"\s*how (?:do|can|should) (?:i|we|you) (?:take|capture|save) (?:a |the )?screenshot\b", query, re.I))
+
+
+def screen_capture_forbidden(query):
+    intent = _screen_intent_text(query)
+    return _screen_opt_out(intent) or _screen_howto(intent)
+
+
+def screen_needed(query, context):
+    intent = _screen_intent_text(query)
+    if not intent or _screen_opt_out(intent) or _screen_howto(intent):
+        return False
+    # A request for a fresh screen always wins over supplied code or an older image.
+    if explicit_screenshot_requested(intent):
+        return True
+    if context.get('image_attached') or context.get('text_attached'):
         return False
     if '```' in query or re.search(r'\b(?:error|code|text|traceback|message)\s*:\s*\S', query, re.I):
         return False
     return bool(re.search(
-        r'\b(?:on my screen|on the screen|on screen|my current screen|my screen|this screen|'
-        r'this (?:page|window|popup|icon)|take (?:a )?screenshot|capture (?:my |the )?screen)\b|'
-        r'^\s*(?:what does this mean|what am i looking at|where (?:do|should) i click)\??\s*$', query, re.I))
+        r"\b(?:on (?:my |the |this )?screen|my (?:current )?screen|this (?:screen|page|window|popup|icon)|"
+        r"(?:look at|inspect|check|describe|read|see|analy[sz]e) (?:my|the|this) (?:screen|desktop|display|monitor))\b|"
+        r"^\s*(?:what does this mean|what am i looking at|where (?:do|should) i click)\??\s*$", query, re.I))
+
+
+def screen_decision(query):
+    return {"route": "answer", "reasoning": bool(re.search(
+        r"\b(error|debug|diagnose|troubleshoot|broken|crash|fix|compare)\b", query, re.I)),
+        "screenshot": True, "command": None}
 
 
 def _single(text):
