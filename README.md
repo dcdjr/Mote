@@ -142,14 +142,29 @@ actual text/vision answers require a running Ollama server and a capable model.
 
 ## Screen context and model capabilities
 
-The router requests screen context when needed. A second check catches explicit
-references such as “on my screen” even if the classifier misses the image flag.
-Supplied error/code text and screenshot how-to questions do not force capture. Mote
-captures the **monitor containing the cursor at submission**, briefly makes its
-own window transparent, then restores its opacity and following. Image data is
-encoded in memory, resized to at most 1600px on its longest side, sent to the
-selected local model, and discarded after the request. Images are not saved or
-retained in conversation history.
+Explicit requests such as “take a screenshot”, “can you see my screen?”, or
+“look at my screen” select the screen path directly without a classifier call.
+Other screen-dependent questions can still be classified by the model. The
+pipeline also checks screen intent so an incorrect command/text route cannot
+silently skip an explicit capture. A fresh capture can be requested alongside an
+attached image or supplied code. Quoted code/copy payloads and screenshot
+how-to questions do not themselves request capture.
+
+Mote captures the **monitor containing the cursor at submission**. On supported
+Windows versions it uses
+[Windows capture exclusion](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowdisplayaffinity)
+for its visible windows, and makes the popup and Mote-owned menus/dialogs
+transparent while capturing. It waits for a compositor frame and flushes DWM
+before reading screen pixels. Opacity and capture settings are restored after
+success, failure, or cancellation; hiding the QWidget is avoided because that
+would cancel the request. Native exclusion still needs verification on Windows.
+
+A **Screenshot attached** notice remains below the response after a successful
+capture, distinguishing actual attachment from an answer merely mentioning the
+screen. Capture failures, empty images, and unsupported vision return errors;
+they do not silently fall back to a text-only answer. Image data is encoded in
+memory, resized to at most 1600px on its longest side, sent to the selected model,
+and discarded after the request. Images are not saved or retained in history.
 
 The installed model/runtime must advertise `vision` in Ollama's `/api/show`
 response. Some `gemma4:e2b` installations advertise text/thinking capabilities
@@ -395,6 +410,7 @@ can execute them or that it can see a screen without an attached image.
 - `integration/apps.py`, `integration/audio.py`: installed-app discovery and Core Audio volume.
 - `scripts/`: live router evaluation and optional model preloading/status.
 - `integration/desktop.py`: GUI-thread screenshot/clipboard/confirmation bridge.
+- `integration/capture.py`: Windows capture exclusion and compositor synchronization.
 - `integration/actions.py`: validated Windows actions and verified keyboard targets.
 - `integration/hotkey.py`: existing native Windows hotkey registration.
 - `tests/`: mocked inference, action validation, UI animation and lifecycle checks.

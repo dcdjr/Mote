@@ -310,6 +310,7 @@ class AssistantPopup(QWidget):
         self.attachments = ()
         self._captured_attachments = set()
         self._attachment_notice = ""
+        self._screenshot_attached = False
         self._file_dialog_open = False
         self._spoken_text = ""
         self.speech = speech or SpeechService(self)
@@ -1287,6 +1288,10 @@ class AssistantPopup(QWidget):
     def _pipeline_status(self, request_id, text) -> None:
         if request_id != self._request_id:
             return
+        if text == "Screenshot attached":
+            self._screenshot_attached = True
+            self.response_notice.setText(" · ".join(filter(None, (self._attachment_notice, "Screenshot attached"))))
+            self.response_notice.setToolTip("A fresh screenshot was captured and attached to this request. Mote is excluded from capture.")
         self.request_state = text.split("…")[0].split(" ·")[0]
         self.send_button.setToolTip(text + " · Enter sends a new request")
         self.thinking.text = text
@@ -1360,7 +1365,7 @@ class AssistantPopup(QWidget):
             return
         self._spoken_text = text
         self.speaker_button.setEnabled(bool(text.strip()) and not self.voice.busy)
-        if not self._attachment_notice:
+        if not self._attachment_notice and not self._screenshot_attached:
             self.response_notice.clear()
         # Commands have a single result rather than a model stream.
         if not self._stream_started and not self._stream_buffer:
@@ -1416,6 +1421,7 @@ class AssistantPopup(QWidget):
         self._spoken_text = ""
         self.speaker_button.setEnabled(False)
         self._attachment_notice = ""
+        self._screenshot_attached = False
         self.response_notice.clear()
         self._copy_available = False
         self.response.clear()

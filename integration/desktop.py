@@ -5,6 +5,7 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from ai.pipeline import Cancelled, PipelineError, validate_command
+from integration.capture import exclude_from_capture, restore_capture_exclusion, sync_compositor
 from integration.actions import (
     WindowsActions,
     activate_target,
@@ -38,6 +39,7 @@ class DesktopIntegration(QObject):
         self._dialog = None
         self._capture_call = None
         self._capture_screen = None
+        self._capture_windows = []
         self._capture_timer = QTimer(self)
         self._capture_timer.setSingleShot(True)
         self._capture_timer.timeout.connect(self._finish_capture)
@@ -89,29 +91,44 @@ class DesktopIntegration(QObject):
         popup._expansion.stop()
         # Complete geometry motion before briefly hiding from the compositor.
         popup.setGeometry(popup._target_geometry(popup._response_height))
+        opacity = 1.0 if popup.state.name == "OPENING" else popup.windowOpacity()
         popup.state = type(popup.state).EXPANDED
-        popup.setWindowOpacity(0.0)
         self._capture_call = call
         self._capture_screen = screen
-        # Let the compositor present an opacity-zero frame before capture.
-        self._capture_timer.start(100)
+        # Include Mote-owned menus/dialogs, not only the main popup.
+        windows = [popup, *(w for w in QApplication.topLevelWidgets() if w is not popup and w.isVisible())]
+        self._capture_windows = [(w, opacity if w is popup else w.windowOpacity(), exclude_from_capture(w)) for w in windows]
+        # Keep widgets logically visible: hide() would cancel this request.
+        # Native exclusion plus opacity protects the underlying desktop pixels.
+        for window, _, _ in self._capture_windows:
+            window.setWindowOpacity(0.0)
+        self._capture_timer.start(150)
 
     def _finish_capture(self):
         call, screen = self._capture_call, self._capture_screen
         if call is None:
             return
         self._capture_call = self._capture_screen = None
+        self._capture_timer.stop()
+        windows, self._capture_windows = self._capture_windows, []
         try:
             if call.cancel.is_set():
                 raise Cancelled()
+            sync_compositor()
             call.resolve(capture_screen(screen))
         except Exception as error:  # noqa: BLE001 - always restore opacity and unblock the worker
             call.resolve(error=error)
         finally:
             self.busy = False
             popup = self.popup
+            for window, opacity, token in windows:
+                restore_capture_exclusion(token)
+                try:
+                    if window.isVisible() and (window is not popup or popup.state.name not in ("CLOSED", "CLOSING")):
+                        window.setWindowOpacity(opacity)
+                except RuntimeError:
+                    pass  # A transient menu/dialog may have been destroyed during the capture wait.
             if popup.isVisible() and popup.state.name not in ("CLOSED", "CLOSING"):
-                popup.setWindowOpacity(1.0)
                 popup._start_following()
 
     def _confirm_shortcut(self, request_id, call, command):

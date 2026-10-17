@@ -357,9 +357,10 @@ class FollowTests(unittest.TestCase):
             self.assertFalse(p._copy_timer.isActive())
             p._pipeline_partial(100, 'A stale response')
             self.assertFalse(p.copy_button.isEnabled())
-            # Await the queued worker/stream callbacks rather than relying on a
-            # fixed 100ms scheduling window while audio libraries are loaded.
-            for _ in range(100):
+            # Worker completion is asynchronous; a fixed 100ms misses queued
+            # signals on slower/offscreen Qt backends.
+            for _ in range(200):
+                self.app.processEvents()
                 if p.copy_button.isEnabled():
                     break
                 QTest.qWait(10)

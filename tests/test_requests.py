@@ -250,6 +250,78 @@ class RequestTests(unittest.TestCase):
                     p._position_at_cursor()
                     self.assertTrue(bounds.contains(p.geometry()))
 
+    def test_native_exclusion_and_compositor_flush_wrap_capture(self):
+        call = DesktopCall('screenshot', None, self.popup.desktop.context(), Event())
+        events = []
+        token = object()
+        with patch('integration.desktop.exclude_from_capture', side_effect=lambda popup: events.append('exclude') or token), \
+             patch('integration.desktop.sync_compositor', side_effect=lambda: events.append('flush')), \
+             patch('integration.desktop.restore_capture_exclusion', side_effect=lambda value: events.append(('restore', value))), \
+             patch('integration.desktop.capture_screen', side_effect=lambda screen: events.append('capture') or b'PNG'):
+            self.popup.desktop.handle(1, call)
+            self.wait_for(call.done.is_set)
+        self.assertEqual(events, ['exclude', 'flush', 'capture', ('restore', token)])
+        self.assertEqual(self.popup.windowOpacity(), 1.0)
+
+    def test_capture_exclusion_restores_on_failure_and_cancel(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                call = DesktopCall('screenshot', None, self.popup.desktop.context(), Event())
+                token = object()
+                with patch('integration.desktop.exclude_from_capture', return_value=token), \
+                     patch('integration.desktop.restore_capture_exclusion') as restore, \
+                     patch('integration.desktop.capture_screen', side_effect=RuntimeError('capture failed')) as grab:
+                    self.popup.desktop.handle(1, call)
+                    if cancel:
+                        self.popup.desktop.cancel_pending()
+                    self.wait_for(call.done.is_set)
+                    restore.assert_called_once_with(token)
+                    if cancel:
+                        grab.assert_not_called()
+                self.assertIsNotNone(call.error)
+                self.assertEqual(self.popup.windowOpacity(), 1.0)
+                self.assertFalse(self.popup.desktop.busy)
+
+    def test_screenshot_notice_persists_until_next_submission(self):
+        pipeline, client = make_pipeline('answer_quick')
+        self.popup.controller.pipeline = pipeline
+        with patch('integration.desktop.capture_screen', return_value=b'PNG'):
+            self.popup.prompt.setText('Take a screenshot')
+            self.popup.submit()
+            self.wait_for(lambda: self.popup.response.toPlainText() == 'Hello world')
+            self.wait_for(lambda: self.popup.controller._worker is None)
+        self.assertIn('Screenshot attached', self.popup.response_notice.text())
+        self.assertTrue(self.popup._screenshot_attached)
+        self.popup.prompt.setText('Hello')
+        self.popup.submit()
+        self.assertFalse(self.popup._screenshot_attached)
+        self.assertNotIn('Screenshot attached', self.popup.response_notice.text())
+
+
+    def test_capture_also_excludes_mote_owned_auxiliary_windows(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QWidget
+        auxiliary = QWidget(self.popup, Qt.WindowType.Tool)
+        auxiliary.show()
+        auxiliary.setWindowOpacity(0.6)
+        original = auxiliary.windowOpacity()
+        call = DesktopCall('screenshot', None, self.popup.desktop.context(), Event())
+        seen = []
+        def grab(screen):
+            seen.append((self.popup.windowOpacity(), auxiliary.windowOpacity()))
+            return b'PNG'
+        try:
+            with patch('integration.desktop.capture_screen', side_effect=grab):
+                self.popup.desktop.handle(1, call)
+                self.wait_for(call.done.is_set)
+            self.assertEqual(seen, [(0.0, 0.0)])
+            self.assertEqual(auxiliary.windowOpacity(), original)
+            self.assertEqual(self.popup.windowOpacity(), 1.0)
+        finally:
+            auxiliary.close()
+            auxiliary.deleteLater()
+
+
 
 if __name__ == '__main__':
     unittest.main()
