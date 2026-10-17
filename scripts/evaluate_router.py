@@ -5,6 +5,7 @@ from pathlib import Path
 import statistics
 import sys
 import time
+from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from router.router import MoteRouter
 
@@ -44,7 +45,8 @@ def evaluate(router, cases=CASES):
             passed = actual == expected_commands and decision['screenshot'] == screenshot
             # Check the motivating request's arguments as well as command names/order.
             if query == 'open youtube and set the volume to 50' and passed:
-                passed = commands[1]['arguments'] == {'level_percent': 50} and 'youtube.com' in commands[0]['arguments']['url']
+                host = urlparse(commands[0]['arguments']['url']).hostname or ''
+                passed = commands[1]['arguments'] == {'level_percent': 50} and host in {'youtube.com', 'www.youtube.com'}
             row = {'query': query, 'passed': passed, 'decision': decision}
         except Exception as error:
             row = {'query': query, 'passed': False, 'error': str(error)}
