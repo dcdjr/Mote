@@ -10,7 +10,15 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+from ai.pipeline import Result
 from ui.popup import AssistantPopup, PopupState
+
+
+class InteractionPipeline:
+    def run(self, prompt, **kwargs):
+        kwargs["status"]("Thinking…")
+        kwargs["partial"](f"Test response: {prompt}")
+        return Result(f"Test response: {prompt}", [])
 
 
 class FollowTests(unittest.TestCase):
@@ -27,12 +35,13 @@ class FollowTests(unittest.TestCase):
         self.now = 100.0
         self.clock = patch("ui.popup.time.monotonic", side_effect=lambda: self.now)
         self.clock.start()
-        self.popup = AssistantPopup()
+        self.popup = AssistantPopup(pipeline=InteractionPipeline())
         self.popup.open_at_cursor()
         self.popup._follow_timer.stop()  # Tick deterministically, never move the OS cursor.
 
     def tearDown(self):
         self.popup.hide()
+        self.popup.controller.shutdown()
         self.popup.deleteLater()
         self.app.processEvents()
         self.clock.stop()
@@ -168,7 +177,7 @@ class FollowTests(unittest.TestCase):
 
     def test_focused_quit_binding(self):
         p = self.popup
-        self.assertEqual([key.toString() for key in p.quit_shortcut.keys()], ["Ctrl+Q"])
+        self.assertEqual([key.toString() for key in p.quit_shortcut.keys()], ["Ctrl+Q"])  # noqa: SIM118 - Qt API
         self.assertEqual(p.quit_shortcut.context(), Qt.ShortcutContext.WindowShortcut)
 
 

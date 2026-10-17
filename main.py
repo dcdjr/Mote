@@ -1,4 +1,4 @@
-"""Run with python main.py (Windows), or --preview to inspect only the UI."""
+"""Run Mote on Windows, or --preview without a global hotkey on other desktops."""
 
 import argparse
 import sys
@@ -10,13 +10,17 @@ from ui.popup import AssistantPopup
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Mote interaction prototype")
+    parser = argparse.ArgumentParser(description="Mote local desktop assistant")
     parser.add_argument("--preview", action="store_true", help="Open UI without registering the global opening hotkey")
     args = parser.parse_args()
     app = QApplication(sys.argv[:1])
     app.setApplicationName("Mote")
     app.setQuitOnLastWindowClosed(False)
-    popup = AssistantPopup()
+    try:
+        popup = AssistantPopup()
+    except (ValueError, OSError) as error:
+        QMessageBox.critical(None, "Mote configuration error", str(error))
+        return 1
 
     if args.preview:
         popup.open_at_cursor()
