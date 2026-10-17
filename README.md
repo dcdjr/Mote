@@ -22,11 +22,13 @@ Ollama's Windows app normally runs its local API in the background. If needed,
 run `ollama serve`. Mote uses that existing API; there is no separate Python
 server to launch. Python dependencies are PySide6, pypdf for PDF extraction,
 and the Ollama Python client (which installs HTTPX and Pydantic), plus
-Windows-only pycaw for audio control. Qt speech support is included in PySide6;
-no additional speech package is required.
+Windows-only pycaw for audio control. Read-aloud support is included in PySide6;
+voice input adds faster-whisper, sounddevice, and a compatible PyAV version
+(all listed in requirements.txt).
 
 The app starts hidden. Model loading happens on the first request, so the first
-answer may take longer. No models are downloaded by Mote.
+answer may take longer. Gemma is installed separately; Whisper downloads only
+when voice recognition first needs it.
 
 ## Use
 
@@ -48,6 +50,51 @@ Examples: “Explain recursion briefly”, “Help me debug this code: …”,
 “What does the error on my screen mean?”, “Open Notepad”,
 “Open example.org”, “Open Visual Studio Code”, “Open YouTube and set the volume to 50”,
 “What can you do?”, or “Copy this text: Hello from Mote”.
+
+## Voice input
+
+Click the **microphone** to record and see live draft text, then click again to
+stop and finalize the transcript. Draft updates are requested about every 1.2
+seconds; actual latency depends on CPU speed and first-time model loading.
+The compact status shows **Listening...** or **Transcribing...**, with a soft
+accent on the microphone. A recording ends automatically after 60 seconds.
+Nothing records when Mote opens or the microphone feature is inactive.
+
+Recognition uses **faster-whisper / Whisper base.en**, entirely on the CPU with
+int8 inference. `sounddevice` captures the default mono microphone; unsupported
+16 kHz capture rates are resampled with PyAV. Starting capture stops read-aloud
+playback, and the speaker is disabled until voice input finishes. No audio is
+uploaded or permanently saved. The loaded recognition model is reused.
+
+The first transcription downloads the model weights from Hugging Face, with a
+visible first-use download status; this requires internet, but speech recognition
+itself is local. Model files are cached under `~/.cache/mote/whisper`. Download,
+voice, and microphone errors appear beside the input controls, with full details
+in the status tooltip. This does not require an API key or a cloud speech API.
+
+Draft text appears at the input cursor with spacing, keeping existing text and
+attachments. Later updates replace only the provisional voice span. Typing
+outside that span is preserved; editing the voice words yourself pauses automatic
+replacement for that recording so your corrections are not overwritten. Stopping
+refines the complete recording once. Review/edit, then press Enter to send;
+transcription never submits automatically. Enter also accepts a current draft.
+The first **Escape** cancels voice input, removes its untouched provisional draft,
+and keeps Mote open (your manual edits remain);
+otherwise Escape dismisses it. The existing **Ctrl+Shift+Space** toggle still
+dismisses Mote immediately and cancels voice input. Ctrl+Shift alone has no action.
+
+For slower systems, select the smaller English model before launching:
+
+```powershell
+$env:MOTE_STT_MODEL = "tiny.en"
+.venv\Scripts\python.exe main.py
+```
+
+Only `base.en` and `tiny.en` are accepted. GPU recognition is deliberately not
+enabled; CPU mode works without CUDA libraries. Capture stops promptly on
+cancellation. Model loading/download and an in-progress inference call cancel
+cooperatively; their late results are discarded. Quit keeps the event loop alive
+until both the voice and AI workers finish, rather than destroying live threads.
 
 ## Read aloud and file attachments
 
@@ -166,6 +213,8 @@ Set variables before launching Mote; restart after changing them.
 | `MOTE_ROUTER_MODEL` | `gemma4:e2b` | Structured decision model; no separate FunctionGemma checkpoint is used. |
 | `MOTE_OLLAMA_HOST` | `http://localhost:11434` | Existing Ollama endpoint, shared by router and answers. |
 | `MOTE_TIMEOUT` | `60` | Request/read timeout in seconds, positive and finite. |
+| `MOTE_STT_MODEL` | `base.en` | Local English voice model: `base.en` or `tiny.en`. |
+| `MOTE_STT_CACHE` | `~/.cache/mote/whisper` | Download/cache directory for local recognition weights. |
 | `MOTE_CONTEXT_LENGTH` | `8192` | Shared router/answer context size; 2048–131072. Smaller contexts reduce memory but can reject/truncate long requests. |
 | `MOTE_GPU_LAYERS` | `auto` | Let Ollama choose GPU offload. Optional integer `num_gpu` override; `0` selects CPU, `999` requests all layers. Hardware/runtime support and enough memory are still required. |
 | `MOTE_KEEP_ALIVE` | `30m` | Ollama residency duration. `-1` keeps the model loaded until Ollama evicts/stops it; `0` unloads after use. |
@@ -182,7 +231,7 @@ inference entirely. Other requests use a compact structured router prompt with
 thinking disabled. Automatic GPU offload is explicitly requested (`num_gpu=-1`).
 Routing and answering share context/GPU settings so switching
 between them does not request a different runner configuration. The application
-does not download models or require inference for supported explicit commands.
+does not download Gemma models or require inference for supported explicit commands.
 
 Use native Ollama on Windows with supported GPU drivers. Ollama automatically
 places models on GPU where possible; an oversized model/context can spill to CPU
@@ -297,10 +346,20 @@ can execute them or that it can see a screen without an attached image.
     With a text-only model, verify the capability error. Test the speaker's
     audible output, stopping, completion, new-request cancellation, and dismissal
     with the installed Windows voice and actual audio device.
+13. Click the microphone, speak, then stop. Verify accurate text appears at the
+    caret without overwriting typed text or submitting. Repeat with attachments,
+    after playing TTS, and with the default microphone at 44.1/48 kHz if available.
+    Test silence, denied permissions, and an unplugged device. Escape should
+    cancel voice input first; dismissal and quit must stop the recording. Rapidly
+    click start/stop/cancel and confirm stale transcripts never appear. Check
+    listening/progress feedback and reduced-motion mode without a layout change.
+    Verify draft text appears while still recording, is revised without duplicate
+    phrases, preserves edits outside it, and refines on Stop. Try correcting the
+    draft manually and canceling after several live updates.
 
 ## Scope and limitations
 
-- Microphone input, arbitrary shell commands, general mouse automation, and
+- Arbitrary shell commands, general mouse automation, and
   automatic website reading/search are not implemented.
 - Installed apps must be discoverable through Windows registration or Start-menu
   shortcuts. App discovery is cached for 60 seconds. Use the full app name if
@@ -328,6 +387,7 @@ can execute them or that it can see a screen without an attached image.
 - `ai/gemma.py`: reusable Ollama client, capabilities, content-only streaming.
 - `services/attachments.py`: file validation, bounded local extraction, structured context.
 - `services/tts.py`: lazy offline speech engine and playback lifecycle.
+- `services/stt.py`: bounded in-memory audio capture, resampling, cached Whisper, cancellation.
 - `router/router.py`: structured router, command-plan validation, and declared schemas.
 - `router/intents.py`, `router/urls.py`: explicit-command fast paths, screen checks, URL normalization.
 - `ai/capabilities.py`: answer-model identity and session-aware capability instructions.
