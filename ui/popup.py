@@ -32,14 +32,18 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLayout,
     QLineEdit,
+    QLabel,
     QMenu,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -48,6 +52,8 @@ from PySide6.QtWidgets import (
 from ai.pipeline import MotePipeline
 from ai.worker import PipelineController
 from integration.desktop import DesktopIntegration
+from services.attachments import AssistantRequest, select_attachments
+from services.tts import SpeechService
 
 
 def _motion_enabled() -> bool:
@@ -170,6 +176,53 @@ class _ThinkingIndicator(QWidget):
         painter.drawText(QRect(46, 0, max(0, self.width() - 46), 40), Qt.AlignmentFlag.AlignVCenter, self.text)
 
 
+class _CopyButton(QPushButton):
+    """Draw a small copy/check icon consistently, including in Linux preview."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("copyButton")
+        self.setFixedSize(28, 28)
+        self.setAccessibleName("Copy response")
+        self.copied = False
+        self.set_copied(False)
+
+    def set_copied(self, copied):
+        self.copied = copied
+        self.setToolTip("Copied" if copied else "Copy response")
+        self.setAccessibleDescription("Response copied to clipboard" if copied else "Copy the displayed response")
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor("#a8ceb4" if self.copied else "#c5c9ce") if self.isEnabled() else QColor("#737980")
+        painter.setPen(QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self.copied:
+            painter.drawLine(QPointF(8, 14), QPointF(12, 18))
+            painter.drawLine(QPointF(12, 18), QPointF(20, 10))
+        else:
+            painter.drawRoundedRect(QRectF(7, 6, 10, 12), 2, 2)
+            painter.drawRoundedRect(QRectF(11, 10, 10, 12), 2, 2)
+
+
+class _ResponsePanel(QPlainTextEdit):
+    ACTION_HEIGHT = 28
+
+    def __init__(self):
+        super().__init__()
+        # A fixed row outside the scrolling viewport keeps the icon off the text
+        # and scrollbar. The editor itself retains its existing glass/shadow.
+        self.setViewportMargins(0, self.ACTION_HEIGHT, 0, 0)
+        self.copy_button = _CopyButton(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.copy_button.move(max(0, self.viewport().geometry().right() + 1 - self.copy_button.width()), 8)
+
+
 class AssistantPopup(QWidget):
     WIDTH = 420
     INPUT_HEIGHT = 96
@@ -180,9 +233,12 @@ class AssistantPopup(QWidget):
     INTERACTION_MARGIN = 45
     RELEASE_MARGIN = 65
     FOLLOW_GRACE = 0.32
-    FOLLOW_LAG = 0.12
+    FOLLOW_LAG = 0.085
+    ATTACHMENT_HEIGHT = 48
+    SIDE_SWITCH_MARGIN = 48
+    FOLLOW_DEADBAND = 2
 
-    def __init__(self, *, pipeline=None) -> None:
+    def __init__(self, *, pipeline=None, speech=None) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("Mote")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -191,6 +247,16 @@ class AssistantPopup(QWidget):
         self.state = PopupState.CLOSED
         self.motion_enabled = _motion_enabled()
         self._response_height = 100
+        self._input_height = self.INPUT_HEIGHT
+        self.attachments = ()
+        self._captured_attachments = set()
+        self._attachment_notice = ""
+        self._file_dialog_open = False
+        self._spoken_text = ""
+        self.speech = speech or SpeechService(self)
+        self.speech.speaking_changed.connect(self._speech_state)
+        self.speech.failed.connect(self._speech_failed)
+        QApplication.instance().aboutToQuit.connect(self.speech.shutdown)
         self._request_id = None
         self.request_state = "Idle"
         self._stream_buffer = []
@@ -201,6 +267,10 @@ class AssistantPopup(QWidget):
         self._follow_paused = False
         self._outside_since = None
         self._follow_position = None
+        self._follow_target = None
+        self._follow_goal = None
+        self._placement_bounds = None
+        self._placement_sides = (1, 1)
         self._follow_last_tick = time.monotonic()
         self._follow_timer = QTimer(self)
         self._follow_timer.setInterval(16)
@@ -213,8 +283,13 @@ class AssistantPopup(QWidget):
         self._window_transition.addAnimation(self._slide)
         self._window_transition.addAnimation(self._fade)
         self._window_transition.finished.connect(self._window_finished)
-        self._expansion = QPropertyAnimation(self, b"geometry", self)
-        self._expansion.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._expansion = QParallelAnimationGroup(self)
+        self._resize_geometry = QPropertyAnimation(self, b"geometry")
+        self._resize_geometry.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._resize_input = QVariantAnimation()
+        self._resize_input.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._expansion.addAnimation(self._resize_geometry)
+        self._expansion.addAnimation(self._resize_input)
         self._expansion.finished.connect(self._expansion_finished)
         self._reveal = QVariantAnimation(self)
         self._reveal.valueChanged.connect(self._reveal_text)
@@ -231,6 +306,7 @@ class AssistantPopup(QWidget):
         self.controller.completed.connect(self._pipeline_completed)
         self.controller.failed.connect(self._pipeline_failed)
         self.controller.desktop_requested.connect(self.desktop.handle)
+        self.controller.attachments_captured.connect(self._attachments_captured)
         self.controller.stopped.connect(QApplication.instance().quit)
         QApplication.instance().aboutToQuit.connect(self.controller.shutdown)
         self.backdrop_status = "Translucent fallback (native backdrop not initialized)"
@@ -284,17 +360,36 @@ class AssistantPopup(QWidget):
                 color: #c7d9ed;
                 border: 1px solid rgba(183, 210, 242, 38);
             }
+            QPushButton#speakerButton:checked {
+                background-color: rgba(157, 190, 226, 26);
+                color: #c7d9ed;
+            }
+            QScrollArea#attachments { background: transparent; border: none; }
+            QWidget#attachmentContent, QWidget#attachmentViewport { background: transparent; }
+            QFrame#attachmentChip {
+                background: rgba(255, 255, 255, 14);
+                border: 1px solid rgba(255, 255, 255, 24);
+                border-radius: 12px;
+            }
+            QLabel { color: #c5c9ce; background: transparent; }
             QPushButton#sendButton {
                 background-color: #dce4ed;
                 color: #242628;
                 padding: 0 12px;
             }
             QPushButton#sendButton:pressed { background-color: #b9c7d6; }
+            QPushButton#copyButton {
+                background-color: rgba(255, 255, 255, 6);
+                border-radius: 8px;
+            }
+            QPushButton#copyButton:hover { background-color: rgba(255, 255, 255, 20); }
+            QPushButton#copyButton:pressed { background-color: rgba(255, 255, 255, 30); }
         """)
 
         self.input_bar = _InputSurface(self)
         self.input_bar.setObjectName("inputBar")
         self.input_bar.setFixedHeight(self.INPUT_HEIGHT)
+        self._resize_input.valueChanged.connect(lambda height: self.input_bar.setFixedHeight(round(height)))
         self.prompt = QLineEdit()
         self.prompt.installEventFilter(self.input_bar)
         self.prompt.setPlaceholderText("Ask Mote anything...")
@@ -306,7 +401,7 @@ class AssistantPopup(QWidget):
         entry.setSpacing(6)
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
-        for glyph, name in (("\ue720", "Microphone"), ("\ue710", "Add attachment")):
+        for glyph, name in (("\ue720", "Microphone"),):
             button = QPushButton(glyph)
             button.setFont(QFont("Segoe MDL2 Assets", 12))
             button.setFixedSize(32, 32)
@@ -314,6 +409,13 @@ class AssistantPopup(QWidget):
             button.setToolTip(f"{name} (coming soon)")
             button.setEnabled(False)
             toolbar.addWidget(button)
+        self.attach_button = QPushButton("\ue723")  # Attach
+        self.attach_button.setFont(QFont("Segoe MDL2 Assets", 12))
+        self.attach_button.setFixedSize(32, 32)
+        self.attach_button.setAccessibleName("Attach files")
+        self.attach_button.setToolTip("Attach documents, code, or images")
+        self.attach_button.clicked.connect(self._pick_attachments)
+        toolbar.addWidget(self.attach_button)
         self.follow_button = QPushButton("\ue718")  # Segoe MDL2 Assets: Pin
         self.follow_button.setObjectName("followButton")
         self.follow_button.setFont(QFont("Segoe MDL2 Assets", 12))
@@ -333,9 +435,27 @@ class AssistantPopup(QWidget):
         self.send_button.clicked.connect(self.submit)
         toolbar.addWidget(self.send_button)
         entry.addLayout(toolbar)
+        self.attachment_strip = QScrollArea()
+        self.attachment_strip.setObjectName("attachments")
+        self.attachment_strip.setFixedHeight(42)
+        self.attachment_strip.setWidgetResizable(True)
+        self.attachment_strip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.attachment_strip.viewport().setObjectName("attachmentViewport")
+        self.attachment_strip.viewport().setAutoFillBackground(False)
+        chip_content = QWidget()
+        chip_content.setObjectName("attachmentContent")
+        self.chip_layout = QHBoxLayout(chip_content)
+        self.chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.chip_layout.setSpacing(6)
+        self.attachment_strip.setWidget(chip_content)
+        # QScrollArea.setWidget() turns autoFillBackground on; undo it afterwards
+        # so the chip row keeps the existing glass instead of a white rectangle.
+        chip_content.setAutoFillBackground(False)
+        self.attachment_strip.hide()
+        entry.addWidget(self.attachment_strip)
         entry.addWidget(self.prompt)
 
-        self.response = QPlainTextEdit()
+        self.response = _ResponsePanel()
         self.response.setObjectName("response")
         self.response.setReadOnly(True)
         self.response.setAccessibleName("Mote response")
@@ -343,6 +463,34 @@ class AssistantPopup(QWidget):
         self.response.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         # The viewport must not paint an opaque rectangle over the glass surface.
         self.response.viewport().setAutoFillBackground(False)
+        self.response.setViewportMargins(0, 28, 0, 0)
+        self.response_actions = QWidget(self.response)
+        actions = QHBoxLayout(self.response_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        self.response_notice = QLabel()
+        self.response_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.response_notice.setFont(QFont("Segoe UI", 9))
+        actions.addWidget(self.response_notice, 1)
+        self.speaker_button = QPushButton("\ue767")  # Volume
+        self.speaker_button.setObjectName("speakerButton")
+        self.speaker_button.setFont(QFont("Segoe MDL2 Assets", 11))
+        self.speaker_button.setFixedSize(28, 26)
+        self.speaker_button.setCheckable(True)
+        self.speaker_button.setEnabled(False)
+        self.speaker_button.setAccessibleName("Read aloud")
+        self.speaker_button.setToolTip("Read aloud")
+        self.speaker_button.clicked.connect(self._toggle_speech)
+        actions.addWidget(self.speaker_button)
+        self.response.installEventFilter(self)
+        self.copy_button = self.response.copy_button
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self._copy_response)
+        self._copy_available = False
+        self._copy_timer = QTimer(self)
+        self._copy_timer.setSingleShot(True)
+        self._copy_timer.setInterval(1400)
+        self._copy_timer.timeout.connect(self._reset_copy_feedback)
+        self.response.textChanged.connect(self._response_text_changed)
         self.thinking = _ThinkingIndicator(self.response.viewport())
         self._reveal_text(1.0)
         self.response.hide()
@@ -384,6 +532,107 @@ class AssistantPopup(QWidget):
         if event.type() in (QEvent.Type.WinIdChange, QEvent.Type.Show) and hasattr(self, "_backdrop_timer"):
             self._backdrop_timer.start(0)
         return result
+
+    def eventFilter(self, watched, event):
+        if watched is self.response and event.type() == QEvent.Type.Resize:
+            self.response_actions.setGeometry(16, 4, max(0, event.size().width() - 32), 26)
+        return super().eventFilter(watched, event)
+
+    def _speech_state(self, speaking):
+        self.speaker_button.setChecked(speaking)
+        action = "Stop reading" if speaking else "Read aloud"
+        self.speaker_button.setToolTip(action)
+        self.speaker_button.setAccessibleName(action)
+
+    def _toggle_speech(self):
+        self.speech.toggle(self._spoken_text)
+        # A checkable button toggles before clicked; failed engine startup must
+        # not leave it highlighted as though playback had started.
+        self.speaker_button.setChecked(self.speech.speaking)
+
+    def _speech_failed(self, message):
+        self.response_notice.setText("Speech unavailable")
+        self.response_notice.setToolTip(message)
+        self.speaker_button.setToolTip(message)
+
+    def _pick_attachments(self):
+        self._file_dialog_open = True
+        self._pause_following()
+        try:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Attach files", "",
+                "Supported files (*.txt *.md *.log *.py *.js *.ts *.html *.css *.json *.csv *.pdf *.png *.jpg *.jpeg *.webp);;All files (*)",
+            )
+            if paths:
+                self.attach_files(paths)
+        finally:
+            self._file_dialog_open = False
+            self._pause_following()  # Preserve the usual leave-zone grace period.
+            if self.isVisible():
+                self._focus_prompt()
+
+    def attach_files(self, paths):
+        self.attachments, errors = select_attachments(paths, self.attachments)
+        self._refresh_attachments()
+        if errors:
+            message = QMessageBox(self)
+            message.setWindowTitle("Could not attach files")
+            message.setIcon(QMessageBox.Icon.Warning)
+            message.setTextFormat(Qt.TextFormat.PlainText)
+            message.setText("\n".join(errors[:6]))
+            message.setDetailedText("\n".join(errors))
+            message.exec()
+
+    def _remove_attachment(self, attachment_id):
+        self.attachments = tuple(a for a in self.attachments if a.id != attachment_id)
+        self._refresh_attachments()
+
+    def _refresh_attachments(self):
+        while self.chip_layout.count():
+            item = self.chip_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for attachment in self.attachments:
+            chip = QFrame()
+            chip.setObjectName("attachmentChip")
+            chip.setFixedHeight(28)
+            chip.setToolTip(attachment.name)
+            row = QHBoxLayout(chip)
+            row.setContentsMargins(8, 0, 3, 0)
+            row.setSpacing(4)
+            icon = QLabel("\ue8a5")
+            icon.setFont(QFont("Segoe MDL2 Assets", 10))
+            row.addWidget(icon)
+            label = QLabel()
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setFont(QFont("Segoe UI", 9))
+            label.setText(label.fontMetrics().elidedText(attachment.name, Qt.TextElideMode.ElideMiddle, 110))
+            label.setFixedWidth(110)
+            row.addWidget(label)
+            remove = QPushButton("×")
+            remove.setFixedSize(22, 22)
+            remove.setAccessibleName(f"Remove {attachment.name}")
+            remove.setToolTip(f"Remove {attachment.name}")
+            remove.clicked.connect(lambda checked=False, item_id=attachment.id: self._remove_attachment(item_id))
+            row.addWidget(remove)
+            self.chip_layout.addWidget(chip)
+        self.chip_layout.addStretch()
+        self.attachment_strip.setVisible(bool(self.attachments))
+        self._input_height = self.INPUT_HEIGHT + (self.ATTACHMENT_HEIGHT if self.attachments else 0)
+        if self.isVisible() and self.state != PopupState.CLOSING:
+            self._animate_layout()
+        else:
+            self.input_bar.setFixedHeight(self._input_height)
+
+    def _attachments_captured(self, request_id, info):
+        if request_id == self._request_id:
+            self._captured_attachments = set(info["ids"])
+            if info["truncated"]:
+                self._attachment_notice = "File excerpts used"
+                self.response_notice.setText(self._attachment_notice)
+                self.response_notice.setToolTip(
+                    "Content was truncated to fit the file/context limits: " + ", ".join(info["truncated"])
+                )
 
     def _configure_backdrop(self) -> None:
         """Request documented DWM Acrylic only on a compatible native surface.
@@ -447,8 +696,9 @@ class AssistantPopup(QWidget):
         menu.deleteLater()
 
     def _fit_to_screen(self, screen) -> None:
+        self.input_bar.setFixedHeight(self._input_height)
         bounds = screen.availableGeometry()
-        height = self.INPUT_HEIGHT
+        height = self._input_height
         if self._expanded:
             height += self.PANEL_GAP + self._response_height
         margin = 2 * self.SHADOW_MARGIN
@@ -462,6 +712,8 @@ class AssistantPopup(QWidget):
         )
 
     def toggle_at_cursor(self) -> None:
+        if self._file_dialog_open:
+            return
         if self.isVisible() and self.state != PopupState.CLOSING:
             self.dismiss()
         else:
@@ -508,14 +760,38 @@ class AssistantPopup(QWidget):
             bounds = screen.availableGeometry()
             self.resize(min(self.width(), bounds.width()), min(self.height(), bounds.height()))
         bounds = screen.availableGeometry()
-        x = cursor.x() + self.CURSOR_OFFSET
-        y = cursor.y() + self.CURSOR_OFFSET
-        if x + self.width() > bounds.right() + 1:
-            x = cursor.x() - self.width() - self.CURSOR_OFFSET
-        if y + self.height() > bounds.bottom() + 1:
-            y = cursor.y() - self.height() - self.CURSOR_OFFSET
-        self.move(x, y)
+        destination = self._cursor_destination(cursor, bounds, self.width(), self.height(), reset=True)
+        self.move(destination.toPoint())
         self._clamp_to_screen(screen)
+
+    def _cursor_destination(self, cursor, bounds, width, height, *, reset=False):
+        """Keep each side until the opposite side offers meaningfully more room.
+
+        All values are Qt logical coordinates; physical DPI scaling belongs to
+        Qt. Re-evaluate placement once on a new monitor/work-area geometry.
+        """
+        reset = reset or bounds != self._placement_bounds
+        coordinates, sides = [], []
+        for value, low, high, size, side in (
+            (cursor.x(), bounds.left(), bounds.right() + 1, width, self._placement_sides[0]),
+            (cursor.y(), bounds.top(), bounds.bottom() + 1, height, self._placement_sides[1]),
+        ):
+            before = value - low - self.CURSOR_OFFSET
+            after = high - value - self.CURSOR_OFFSET
+            if reset:
+                side = 1 if after >= size else -1
+            else:
+                room, opposite = (after, before) if side == 1 else (before, after)
+                if room < size - self.SIDE_SWITCH_MARGIN and opposite > room + self.SIDE_SWITCH_MARGIN:
+                    side = -side
+            position = value + self.CURSOR_OFFSET if side == 1 else value - self.CURSOR_OFFSET - size
+            coordinates.append(max(low, min(position, high - size)))
+            sides.append(side)
+        if reset:
+            self._follow_goal = None
+        self._placement_bounds = QRect(bounds)
+        self._placement_sides = tuple(sides)
+        return QPointF(*coordinates)
 
     def _set_follow_enabled(self, enabled: bool) -> None:
         self.follow_enabled = enabled
@@ -527,7 +803,7 @@ class AssistantPopup(QWidget):
             self._stop_following()
 
     def _start_following(self) -> None:
-        self._follow_position = None
+        self._reset_follow_motion()
         self._outside_since = None
         self._follow_paused = False
         self._follow_last_tick = time.monotonic()
@@ -536,19 +812,24 @@ class AssistantPopup(QWidget):
 
     def _stop_following(self) -> None:
         self._follow_timer.stop()
-        self._follow_position = None
+        self._reset_follow_motion()
         self._outside_since = None
+
+    def _reset_follow_motion(self) -> None:
+        self._follow_position = self._follow_target = self._follow_goal = None
 
     def _pause_following(self) -> None:
         self._follow_paused = True
         self._outside_since = None
-        self._follow_position = None
+        self._reset_follow_motion()
 
     def _follow_cursor(self) -> None:
         if not self.isVisible() or not self.follow_enabled or self.state == PopupState.CLOSING:
             self._stop_following()
             return
-        if self.desktop.busy:
+        if self.desktop.busy or self._file_dialog_open:
+            self._reset_follow_motion()
+            self._follow_last_tick = time.monotonic()
             return
         now = time.monotonic()
         elapsed = min(0.05, max(0.0, now - self._follow_last_tick))
@@ -577,33 +858,45 @@ class AssistantPopup(QWidget):
         # Geometry animations have exclusive ownership until they finish. We
         # still sample interaction above; afterwards we ease from the final rect.
         if self.state in (PopupState.OPENING, PopupState.EXPANDING):
-            self._follow_position = None
+            self._reset_follow_motion()
             return
         screen = QApplication.screenAt(cursor) or QApplication.primaryScreen()
         bounds = screen.availableGeometry()
         width = min(self.WIDTH + 2 * self.SHADOW_MARGIN, bounds.width())
-        natural_height = self.INPUT_HEIGHT + 2 * self.SHADOW_MARGIN
+        natural_height = self._input_height + 2 * self.SHADOW_MARGIN
         if self._expanded:
             natural_height += self.PANEL_GAP + self._response_height
         height = min(natural_height, bounds.height())
-        x = cursor.x() + self.CURSOR_OFFSET
-        y = cursor.y() + self.CURSOR_OFFSET
-        if x + width > bounds.right() + 1:
-            x = cursor.x() - width - self.CURSOR_OFFSET
-        if y + height > bounds.bottom() + 1:
-            y = cursor.y() - height - self.CURSOR_OFFSET
-        target = QPointF(
-            max(bounds.left(), min(x, bounds.right() - width + 1)),
-            max(bounds.top(), min(y, bounds.bottom() - height + 1)),
-        )
+        target = self._cursor_destination(cursor, bounds, width, height)
+        if self._follow_goal is None or (target - self._follow_goal).manhattanLength() > self.FOLLOW_DEADBAND:
+            self._follow_goal = target
+        target = self._follow_goal
         if self._follow_position is None:
             self._follow_position = QPointF(self.pos())
-        alpha = 1.0 if not self.motion_enabled else 1.0 - math.exp(-elapsed / self.FOLLOW_LAG)
-        position = self._follow_position + (target - self._follow_position) * alpha
-        if (target - position).manhattanLength() < 0.5:
+            self._follow_target = QPointF(self.pos())
+        if self.motion_enabled:
+            # Two exponential filters give a gentle start and stop instead of
+            # an immediate velocity jump. This is their exact time-based step,
+            # so different timer/frame rates produce the same trajectory.
+            step = elapsed / self.FOLLOW_LAG
+            decay = math.exp(-step)
+            offset = self._follow_target - target
+            position = target + (self._follow_position - target + offset * step) * decay
+            self._follow_target = target + offset * decay
+        else:
             position = target
+            self._follow_target = target
+        if ((target - position).manhattanLength() < 0.25
+                and (target - self._follow_target).manhattanLength() < 0.25):
+            position = self._follow_target = target
         self._follow_position = position
         rect = QRect(round(position.x()), round(position.y()), width, height)
+        if not any(s.availableGeometry().intersects(rect) for s in QApplication.screens()):
+            # Disjoint/mixed-DPI desktops may have logical gaps. Do not let the
+            # trailing window disappear into one; rebase on the destination.
+            rect.moveLeft(max(bounds.left(), min(rect.x(), bounds.right() - width + 1)))
+            rect.moveTop(max(bounds.top(), min(rect.y(), bounds.bottom() - height + 1)))
+            self._follow_position = self._follow_target = QPointF(rect.topLeft())
         if rect != self.geometry():
             # Intermediate frames may span adjacent monitors; only the target is
             # clamped, avoiding a teleport when the pointer crosses a boundary.
@@ -659,6 +952,8 @@ class AssistantPopup(QWidget):
         super().hideEvent(event)
 
     def _cancel_response(self) -> None:
+        self.speech.stop()
+        self._captured_attachments.clear()
         self.controller.cancel()
         self.desktop.cancel_pending()
         self._request_id = None
@@ -672,11 +967,31 @@ class AssistantPopup(QWidget):
         self._stream_started = False
         self._stream_done = False
         self._reveal_text(1.0)
+        self._reset_copy_feedback()
+
+    def _reset_copy_feedback(self) -> None:
+        self._copy_timer.stop()
+        self.copy_button.set_copied(False)
+
+    def _response_text_changed(self) -> None:
+        self._reset_copy_feedback()
+        self.copy_button.setEnabled(self._copy_available and bool(self.response.toPlainText().strip()))
+
+    def _copy_response(self) -> None:
+        if not self.copy_button.isEnabled():
+            return
+        text = self.response.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.copy_button.set_copied(True)
+            self._copy_timer.start()
 
     def _request_quit(self) -> None:
         self._cancel_response()
+        self._copy_available = False
         self.prompt.setEnabled(False)
         self.send_button.setEnabled(False)
+        self.attach_button.setEnabled(False)
         self.response.setPlainText("Closing Mote… Waiting for the current connection to finish.")
         self.controller.request_stop()
 
@@ -697,7 +1012,7 @@ class AssistantPopup(QWidget):
         return rect
 
     def _target_geometry(self, response_height):
-        height = self.INPUT_HEIGHT + 2 * self.SHADOW_MARGIN
+        height = self._input_height + 2 * self.SHADOW_MARGIN
         if response_height is not None:
             height += self.PANEL_GAP + response_height
         target = QRect(self.geometry())
@@ -705,22 +1020,29 @@ class AssistantPopup(QWidget):
         return self._bounded_rect(target)
 
     def _expand_to(self, height) -> None:
+        self._response_height = height
+        self._expanded = True
+        self.response.show()
+        self._animate_layout()
+
+    def _animate_layout(self) -> None:
+        self._reset_follow_motion()
         self._window_transition.stop()
         self.setWindowOpacity(1.0)
         self._expansion.stop()
-        self._response_height = height
-        self._expanded = True
         self.state = PopupState.EXPANDING
-        self.response.show()
-        self._expansion.setStartValue(self.geometry())
-        self._rest_geometry = self._target_geometry(height)
-        self._expansion.setEndValue(self._rest_geometry)
-        self._expansion.setDuration(300 if self.motion_enabled else 0)
+        self._resize_geometry.setStartValue(self.geometry())
+        self._rest_geometry = self._target_geometry(self._response_height if self._expanded else None)
+        self._resize_geometry.setEndValue(self._rest_geometry)
+        self._resize_input.setStartValue(self.input_bar.height())
+        self._resize_input.setEndValue(self._input_height)
+        for animation in (self._resize_geometry, self._resize_input):
+            animation.setDuration(300 if self.motion_enabled else 0)
         self._expansion.start()
 
     def _expansion_finished(self) -> None:
         if self.state == PopupState.EXPANDING:
-            self.state = PopupState.EXPANDED
+            self.state = PopupState.EXPANDED if self._expanded else PopupState.COLLAPSED
             if self._stream_buffer or self._stream_done:
                 self._start_stream_reveal()
 
@@ -782,6 +1104,8 @@ class AssistantPopup(QWidget):
                 scrollbar.setValue(scrollbar.maximum())
         if self._stream_done:
             self._stream_timer.stop()
+            self._copy_available = True
+            self.copy_button.setEnabled(bool(self.response.toPlainText().strip()))
             self._finish_response_size()
 
     def _finish_response_size(self) -> None:
@@ -789,13 +1113,17 @@ class AssistantPopup(QWidget):
         document.setDefaultFont(self.response.font())
         document.setPlainText(self.response.toPlainText())
         document.setTextWidth(max(80, self.response.width() - 52))
-        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 44))
+        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 44 + self.response.ACTION_HEIGHT))
         if height != self._response_height:
             self._expand_to(height)
 
     def _pipeline_completed(self, request_id, text) -> None:
         if request_id != self._request_id:
             return
+        self._spoken_text = text
+        self.speaker_button.setEnabled(bool(text.strip()))
+        if not self._attachment_notice:
+            self.response_notice.clear()
         # Commands have a single result rather than a model stream.
         if not self._stream_started and not self._stream_buffer:
             self._stream_buffer.append(text)
@@ -806,10 +1134,16 @@ class AssistantPopup(QWidget):
             self._start_stream_reveal()
         if self._stream_started and not self.thinking.isVisible():
             self._flush_stream()
+        if self._captured_attachments:
+            self.attachments = tuple(a for a in self.attachments if a.id not in self._captured_attachments)
+            self._captured_attachments.clear()
+            self._refresh_attachments()
 
     def _pipeline_failed(self, request_id, text) -> None:
         if request_id != self._request_id:
             return
+        self._spoken_text = ""
+        self.speaker_button.setEnabled(False)
         self._thinking_fade.stop()
         self.thinking.pulse.stop()
         self.thinking.hide()
@@ -819,6 +1153,7 @@ class AssistantPopup(QWidget):
         self._stream_done = True
         self._reveal.stop()
         self._reveal_text(1.0)
+        self._copy_available = False
         self.response.setPlainText(text)
         self.request_state = "Error"
         self.send_button.setToolTip("Try again (Enter)")
@@ -836,6 +1171,11 @@ class AssistantPopup(QWidget):
         if not text or self.state in (PopupState.CLOSED, PopupState.CLOSING):
             return
         self._cancel_response()
+        self._spoken_text = ""
+        self.speaker_button.setEnabled(False)
+        self._attachment_notice = ""
+        self.response_notice.clear()
+        self._copy_available = False
         self.response.clear()
         self.request_state = "Routing"
         self.thinking.text = "Routing…"
@@ -845,6 +1185,7 @@ class AssistantPopup(QWidget):
             self.thinking.pulse.start()
         # Reserve a response panel once; token updates only append text.
         self._expand_to(self.RESPONSE_HEIGHT)
-        self._request_id = self.controller.submit(text, self.desktop.context())
+        request = AssistantRequest(text, self.attachments) if self.attachments else text
+        self._request_id = self.controller.submit(request, self.desktop.context())
         if self.controller.waiting:
             self._pipeline_status(self._request_id, "Routing · waiting for previous connection…")

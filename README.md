@@ -20,8 +20,10 @@ py -m venv .venv
 
 Ollama's Windows app normally runs its local API in the background. If needed,
 run `ollama serve`. Mote uses that existing API; there is no separate Python
-server to launch. Python dependencies are PySide6 and the Ollama Python client
-(which installs HTTPX and Pydantic), plus Windows-only pycaw for audio control.
+server to launch. Python dependencies are PySide6, pypdf for PDF extraction,
+and the Ollama Python client (which installs HTTPX and Pydantic), plus
+Windows-only pycaw for audio control. Qt speech support is included in PySide6;
+no additional speech package is required.
 
 The app starts hidden. Model loading happens on the first request, so the first
 answer may take longer. No models are downloaded by Mote.
@@ -46,6 +48,50 @@ Examples: “Explain recursion briefly”, “Help me debug this code: …”,
 “What does the error on my screen mean?”, “Open Notepad”,
 “Open example.org”, “Open Visual Studio Code”, “Open YouTube and set the volume to 50”,
 “What can you do?”, or “Copy this text: Hello from Mote”.
+
+## Read aloud and file attachments
+
+The **speaker** in the response header reads the completed answer; click again
+to stop. Speech is opt-in and uses Qt Text-to-Speech's native **SAPI** backend
+on Windows, with installed offline Windows voices. It does not read loading
+states, error messages, or model reasoning. Playback stops on dismissal, a new
+request, or shutdown. If voices/audio are unavailable, the header shows an error
+with details in its tooltip. No cloud speech API or per-sentence process is used.
+
+Click the **paperclip** to select multiple files in the native file picker:
+
+- Text/code/data: `.txt`, `.md`, `.log`, `.py`, `.js`, `.ts`, `.html`, `.css`,
+  `.json`, `.csv`.
+- Documents: `.pdf` with extractable text. Password-protected, scanned, and
+  damaged PDFs produce an explanation; OCR is not included.
+- Images: `.png`, `.jpg`, `.jpeg`, `.webp`. The selected Ollama model must
+  advertise vision; otherwise the request fails clearly without image analysis.
+
+Selected files appear as removable, horizontally scrollable chips above the
+input. Following pauses while the picker is open. Chips stay during processing
+and on failure/cancellation, and clear only after a successful response and
+worker confirmation that their contents were captured. Files added while an
+earlier request is running remain available for the next request.
+
+Limits: **6 files**, **10 MB per file**, **25 MB combined**, and **20 megapixels
+per image**. Text uses UTF-8/UTF-16 BOM handling with a Windows-1252 fallback.
+Formatting is preserved. Each file contributes up to 16K characters, with a
+shared 48K-character context budget; PDFs are limited to 50 pages. A visible
+**File excerpts used** notice and request metadata identify truncation.
+
+Extraction runs in the existing worker. A structured request keeps the user's
+question separate from filenames, file types, excerpts, truncation flags, and
+image bytes. The router sees only the question; requests with attachments always
+use the answer path and cannot execute desktop commands. The model is instructed
+to treat file content as untrusted reference data. Ollama receives image bytes
+through its multimodal `images` field, combined with explicit screen context if
+requested. Files/images are not retained in conversation history.
+
+Selecting files does not upload them. **Send/Enter** sends prepared context to
+the configured `MOTE_OLLAMA_HOST` (localhost by default); a remote endpoint, if
+explicitly configured, receives that context. Existing Ollama/model availability
+errors preserve the chips for retry. No separate future Gemma wiring is needed;
+actual text/vision answers require a running Ollama server and a capable model.
 
 ## Screen context and model capabilities
 
@@ -243,16 +289,26 @@ can execute them or that it can see a screen without an attached image.
     `MOTE_TIMEOUT`. Verify actionable errors and recovery after fixing the
     configuration/restarting Ollama. Start two Mote instances to verify the
     hotkey-conflict error.
+11. Click the paperclip, select several supported files, remove a chip, and
+    check that the picker does not hide Mote or move it. Submit code/PDF context
+    and verify a real model answer uses its contents. Try long text, a scanned
+    PDF, and an oversized/unsupported file. Check retry preserves attachments.
+12. With a vision model, attach an image and ask a specific visual question.
+    With a text-only model, verify the capability error. Test the speaker's
+    audible output, stopping, completion, new-request cancellation, and dismissal
+    with the installed Windows voice and actual audio device.
 
 ## Scope and limitations
 
-- Microphone input, file attachments, arbitrary shell commands, general mouse
-  automation, and automatic website reading/search are not implemented.
+- Microphone input, arbitrary shell commands, general mouse automation, and
+  automatic website reading/search are not implemented.
 - Installed apps must be discoverable through Windows registration or Start-menu
   shortcuts. App discovery is cached for 60 seconds. Use the full app name if
   several installed apps match.
 - Plans contain at most eight supported commands, execute sequentially, and stop
   at the first failure/declined shortcut. They do not wait for app load completion.
+- OCR, arbitrary shell commands, general mouse automation, and automatic website
+  reading/search are not implemented.
 - The router accepts a 4KB request/context budget; long pasted requests may need
   shortening. Conversation memory is limited to six messages / 12K characters
   and disappears on exit. Images from prior turns are not reused.
@@ -270,6 +326,8 @@ can execute them or that it can see a screen without an attached image.
 - `ai/pipeline.py`: router → answer/screenshot/command orchestration and bounded context.
 - `ai/worker.py`: Qt worker, cancellation, stale-update guards, safe shutdown.
 - `ai/gemma.py`: reusable Ollama client, capabilities, content-only streaming.
+- `services/attachments.py`: file validation, bounded local extraction, structured context.
+- `services/tts.py`: lazy offline speech engine and playback lifecycle.
 - `router/router.py`: structured router, command-plan validation, and declared schemas.
 - `router/intents.py`, `router/urls.py`: explicit-command fast paths, screen checks, URL normalization.
 - `ai/capabilities.py`: answer-model identity and session-aware capability instructions.
