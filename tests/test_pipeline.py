@@ -4,7 +4,7 @@ import json
 import unittest
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, call
 
 import httpx
 from ollama import ResponseError
@@ -102,7 +102,8 @@ class PipelineTests(unittest.TestCase):
         pipeline, client = make_pipeline('open_application', {'application': 'notepad'})
         desktop = Mock(return_value='Opened Notepad')
         result = pipeline.run('Open Notepad', desktop=desktop)
-        desktop.assert_called_once_with('command', {'name': 'open_application', 'arguments': {'application': 'notepad'}})
+        desktop.assert_has_calls([call('prepare_commands', [{'name': 'open_application', 'arguments': {'application': 'notepad'}}]),
+                                 call('command', {'name': 'open_application', 'arguments': {'application': 'notepad'}})])
         client.chat.assert_not_called()
         self.assertEqual(result.text, 'Opened Notepad')
 
@@ -222,10 +223,11 @@ class ActionTests(unittest.TestCase):
             executor.execute({'name': 'copy_text', 'arguments': {'text': 'exact text'}}, clipboard=clipboard)
             clipboard.setText.assert_called_once_with('exact text')
 
-    def test_volume_unsupported_and_windows_guard(self):
+    def test_volume_dispatch_and_windows_guard(self):
         executor = WindowsActions()
-        with patch('integration.actions.sys.platform', 'win32'), self.assertRaisesRegex(PipelineError, 'not integrated'):
-            executor.execute({'name': 'set_volume', 'arguments': {'level_percent': 50}})
+        with patch('integration.actions.sys.platform', 'win32'), patch('integration.actions.change_volume', return_value='Set system volume to 50%.') as volume:
+            self.assertEqual(executor.execute({'name': 'set_volume', 'arguments': {'level_percent': 50}}), 'Set system volume to 50%.')
+            volume.assert_called_once_with('set_volume', {'level_percent': 50})
         with patch('integration.actions.sys.platform', 'linux'), self.assertRaisesRegex(PipelineError, 'preview'):
             executor.execute({'name': 'open_application', 'arguments': {'application': 'notepad'}})
 
