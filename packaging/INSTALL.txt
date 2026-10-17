@@ -1,0 +1,16 @@
+Mote runs as a tray utility. Open it with Ctrl+Shift+Space, or use its tray menu.
+Settings lets you change that shortcut, model, following, and glass opacity.
+
+The installer includes Python and application dependencies. It does NOT include
+Ollama, a Gemma model, or the Whisper speech model.
+
+1. Install and start Ollama: https://ollama.com/download/windows
+2. In a terminal run: ollama pull gemma4:e2b
+3. In Mote Settings click Refresh and select a verified vision model with <=6B
+   total parameters. If your installed E2B model lacks vision, install another
+   eligible model, for example: ollama pull gemma3:4b
+4. Click Use model. You can now ask questions or ask about your screen.
+
+Microphone input is opt-in; first use downloads the small local Whisper model.
+Read aloud uses an installed Windows offline voice. Internet is needed for
+initial model downloads, not for inference with downloaded local models.

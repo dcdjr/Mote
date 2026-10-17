@@ -107,6 +107,19 @@ class PipelineController(QObject):
         self._worker = None
         self._pending = None
         self._closing = False
+        self._pending_model = None
+
+    def set_model(self, model):
+        """Apply at a worker boundary; never mutate a backend used by inference."""
+        self._pending_model = model
+        if self._worker is None:
+            self._apply_model()
+
+    def _apply_model(self):
+        if self._pending_model is not None:
+            from ai.gemma import GemmaBackend
+            self.pipeline.backend = GemmaBackend(client=self.pipeline.backend.client, model=self._pending_model)
+            self._pending_model = None
 
     def submit(self, prompt, context=None):
         self.cancel()
@@ -175,6 +188,7 @@ class PipelineController(QObject):
         self._worker.wait()  # finished is emitted just before QThread fully exits.
         self._worker.deleteLater()
         self._worker = None
+        self._apply_model()
         if self._closing:
             self.stopped.emit()
         else:

@@ -1,5 +1,27 @@
 # Mote
 
+## Windows app and release build
+
+Use the toolbar **gear** or tray **Settings** to choose a verified installed
+vision model (≤6B total parameters), record a global shortcut, toggle following,
+and adjust glass opacity. These preferences persist. The tray provides Open,
+Settings, and Quit. The Gemma router remains separate from the selected answer
+model; model changes apply safely between requests.
+
+Build the native per-user Windows installer with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+```
+
+Requires Windows x64, Python, and Inno Setup 6. Output after a successful build:
+`dist\installer\MoteSetup.exe`. A **Windows installer** GitHub Actions workflow
+is also included. **No Windows installer artifact has been generated in this
+Linux development session.** See [RELEASE.md](RELEASE.md) for build, Ollama/model
+setup, configuration, package smoke checks, and the native verification checklist.
+The installer bundles Python/dependencies; Ollama and model downloads are separate.
+
+
 Mote is a local Windows desktop assistant beside your cursor. Press
 **Ctrl+Shift+Space**, ask a question, and receive a streamed Gemma response.
 The router selects an answer, screen context, or up to eight Windows actions.
@@ -171,11 +193,11 @@ response. Some `gemma4:e2b` installations advertise text/thinking capabilities
 without vision. Mote reports this clearly rather than sending an unsupported
 image request. To use screen analysis, install a vision-capable local Gemma
 variant and select it as the answer model. For example, **if your installation
-advertises vision for `gemma4:12b`**:
+advertises vision for `gemma3:4b`**:
 
 ```powershell
-ollama pull gemma4:12b
-$env:MOTE_MODEL = "gemma4:12b"
+ollama pull gemma3:4b
+$env:MOTE_MODEL = "gemma3:4b"
 .venv\Scripts\python.exe main.py
 ```
 
@@ -220,7 +242,9 @@ operation. These checks follow the [Windows SendInput API](https://learn.microso
 
 ## Configuration
 
-Set variables before launching Mote; restart after changing them.
+Set variables before launching Mote; restart after changing them. A saved model
+choice in Settings takes precedence over the initial MOTE_MODEL value. Use
+Settings to switch an existing installation without restarting.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

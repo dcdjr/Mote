@@ -36,9 +36,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
+    QLabel,
     QLayout,
     QLineEdit,
-    QLabel,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
@@ -53,9 +53,10 @@ from ai.pipeline import MotePipeline
 from ai.worker import PipelineController
 from integration.desktop import DesktopIntegration
 from services.attachments import AssistantRequest, select_attachments
-from services.tts import SpeechService
 from services.stt import VoiceService
+from services.tts import SpeechService
 
+GLASS_RADIUS = 28
 
 def _motion_enabled() -> bool:
     if sys.platform == "win32":
@@ -111,7 +112,7 @@ class _InputSurface(QFrame):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setPen(QPen(QColor(164, 195, 228, round(65 * self.accent)), 1))
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 28, 28)
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), GLASS_RADIUS, GLASS_RADIUS)
 
 
 class _SendButton(QPushButton):
@@ -302,6 +303,9 @@ class AssistantPopup(QWidget):
         self.setWindowTitle("Mote")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFont(QFont("Segoe UI", 11))
+        self.preferences = None
+        self.hotkey = None
+        self._settings_panel = None
         self._expanded = False
         self.state = PopupState.CLOSED
         self.motion_enabled = _motion_enabled()
@@ -462,6 +466,9 @@ class AssistantPopup(QWidget):
             QPushButton#copyButton:pressed { background-color: rgba(255, 255, 255, 30); }
         """)
 
+        self._glass_stylesheet = self.styleSheet().replace("border-radius: 20px;", f"border-radius: {GLASS_RADIUS}px;").replace("border-radius: 28px;", f"border-radius: {GLASS_RADIUS}px;")
+        self.setStyleSheet(self._glass_stylesheet)
+
         self.input_bar = _InputSurface(self)
         self.input_bar.setObjectName("inputBar")
         self.input_bar.setFixedHeight(self.INPUT_HEIGHT)
@@ -501,6 +508,13 @@ class AssistantPopup(QWidget):
         self.follow_button.setToolTip("Disable cursor following")
         self.follow_button.toggled.connect(self._set_follow_enabled)
         toolbar.addWidget(self.follow_button)
+        self.settings_button = QPushButton('⚙')
+        self.settings_button.setFont(QFont('Segoe UI Symbol', 15))
+        self.settings_button.setFixedSize(32, 32)
+        self.settings_button.setAccessibleName('Mote settings')
+        self.settings_button.setToolTip('Settings')
+        self.settings_button.clicked.connect(self.open_settings)
+        toolbar.addWidget(self.settings_button)
         self.voice_notice = QLabel()
         self.voice_notice.setTextFormat(Qt.TextFormat.PlainText)
         self.voice_notice.setFont(QFont("Segoe UI", 9))
@@ -615,6 +629,27 @@ class AssistantPopup(QWidget):
             widget.customContextMenuRequested.connect(
                 lambda position, target=widget: self._show_menu(target, position)
             )
+
+    def configure_preferences(self, preferences, hotkey=None):
+        self.preferences, self.hotkey = preferences, hotkey
+        self.follow_button.setChecked(preferences.follow)
+        self.set_glass_opacity(preferences.opacity)
+
+    def set_glass_opacity(self, percent):
+        percent = max(60, min(100, int(percent)))
+        self.glass_opacity = percent
+        style = self._glass_stylesheet
+        for rgb, alpha in (('49, 53, 60',239), ('28, 31, 37',232), ('41, 45, 52',242), ('26, 29, 35',238)):
+            style = style.replace(f'rgba({rgb}, {alpha})', f'rgba({rgb}, {round(alpha * percent / 100)})')
+        self.setStyleSheet(style)
+
+    def open_settings(self):
+        if self._settings_panel is None:
+            from config import Preferences
+            from ui.settings import SettingsPanel
+            self._settings_panel = SettingsPanel(self, self.preferences or Preferences(), self.hotkey)
+        self._pause_following()
+        self._settings_panel.open_near()
 
     def event(self, event) -> bool:
         result = super().event(event)
@@ -748,7 +783,8 @@ class AssistantPopup(QWidget):
         self._maybe_quit()
 
     def _maybe_quit(self):
-        if self._quitting and self._pipeline_stopped and not self.voice.busy and not self._quit_sent:
+        if (self._quitting and self._pipeline_stopped and not self.voice.busy and not self._quit_sent
+                and not (self._settings_panel is not None and self._settings_panel.busy)):
             self._quit_sent = True
             QApplication.instance().quit()
 
@@ -997,6 +1033,11 @@ class AssistantPopup(QWidget):
 
     def _set_follow_enabled(self, enabled: bool) -> None:
         self.follow_enabled = enabled
+        if self.preferences is not None:
+            try:
+                self.preferences.set('follow', enabled)
+            except OSError as error:
+                self.follow_button.setToolTip(str(error))
         self.follow_button.setToolTip("Disable cursor following" if enabled else "Enable cursor following")
         self.follow_button.setAccessibleDescription("Enabled" if enabled else "Disabled")
         if enabled:
@@ -1029,7 +1070,7 @@ class AssistantPopup(QWidget):
         if not self.isVisible() or not self.follow_enabled or self.state == PopupState.CLOSING:
             self._stop_following()
             return
-        if self.desktop.busy or self._file_dialog_open:
+        if self.desktop.busy or self._file_dialog_open or (self._settings_panel is not None and self._settings_panel.isVisible()):
             self._reset_follow_motion()
             self._follow_last_tick = time.monotonic()
             return
@@ -1224,6 +1265,8 @@ class AssistantPopup(QWidget):
 
     def _request_quit(self) -> None:
         self._quitting = True
+        if self._settings_panel is not None:
+            self._settings_panel.request_stop()
         self.mic_button.setEnabled(False)
         self.voice.request_stop()
         self._cancel_response()

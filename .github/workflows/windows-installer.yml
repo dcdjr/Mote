@@ -1,0 +1,31 @@
+name: Windows installer
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            packaging/build-requirements.txt
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+      - name: Test, package, smoke-test, and create installer
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+      - name: Upload installer and resolved build dependencies
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mote-Windows-installer
+          path: dist/installer/*
+          if-no-files-found: error
