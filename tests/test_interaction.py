@@ -2,11 +2,12 @@
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -162,6 +163,212 @@ class FollowTests(unittest.TestCase):
                 self.cursor = point
                 self.tick()
                 self.assertTrue(bounds.contains(p.geometry()))
+
+    def test_motion_accelerates_gently_and_settles_without_repeated_moves(self):
+        p = self.popup
+        p.motion_enabled = True
+        p.move(50, 50)
+        self.cursor = QPoint(600, 400)
+        distances = []
+        for _ in range(20):
+            previous = p.pos()
+            self.tick()
+            distances.append((p.pos() - previous).manhattanLength())
+        self.assertGreater(distances[0], 0)
+        self.assertLess(distances[0], distances[1])
+        self.assertLess(distances[1], max(distances))
+        self.assertLess(distances[-1], max(distances))
+        self.tick(150)
+        with patch.object(p, 'setGeometry', wraps=p.setGeometry) as move:
+            self.tick(50)
+            move.assert_not_called()
+
+    def test_motion_is_consistent_across_timer_rates(self):
+        p = self.popup
+        p.motion_enabled = True
+        screen = Mock()
+        screen.availableGeometry.return_value = QRect(0, 0, 1920, 1200)
+        self.cursor = QPoint(900, 600)
+        positions = []
+        with (patch('ui.popup.QApplication.screenAt', return_value=screen),
+              patch('ui.popup.QApplication.screens', return_value=[screen])):
+            for interval in (0.008, 0.016, 0.032):
+                p.move(50, 50)
+                p._reset_follow_motion()
+                p._follow_paused = False
+                p._placement_bounds = None
+                p._follow_last_tick = self.now
+                for _ in range(round(0.096 / interval)):
+                    self.now += interval
+                    p._follow_cursor()
+                positions.append(p.pos())
+        for position in positions[1:]:
+            self.assertLessEqual((position - positions[0]).manhattanLength(), 1)
+
+    def test_side_hysteresis_prevents_repeated_flips_near_all_edges(self):
+        p = self.popup
+        bounds = QRect(0, 0, 1600, 1000)
+        width, height = p.width(), p.height()
+        x_threshold = bounds.right() + 1 - width - p.CURSOR_OFFSET
+        y_threshold = bounds.bottom() + 1 - height - p.CURSOR_OFFSET
+        p._cursor_destination(QPoint(x_threshold - 20, y_threshold - 20), bounds, width, height, reset=True)
+        self.assertEqual(p._placement_sides, (1, 1))
+        for offset in (-12, 12, -8, 8) * 5:
+            goal = p._cursor_destination(QPoint(x_threshold + offset, y_threshold + offset), bounds, width, height)
+            self.assertEqual(p._placement_sides, (1, 1))
+            self.assertTrue(bounds.contains(QRect(goal.toPoint(), p.size())))
+        p._cursor_destination(QPoint(1500, 970), bounds, width, height)
+        self.assertEqual(p._placement_sides, (-1, -1))
+        for offset in (-12, 12, -8, 8) * 5:
+            p._cursor_destination(QPoint(x_threshold + offset, y_threshold + offset), bounds, width, height)
+            self.assertEqual(p._placement_sides, (-1, -1))
+        p._cursor_destination(QPoint(40, 40), bounds, width, height)
+        self.assertEqual(p._placement_sides, (1, 1))
+
+    def test_small_pointer_noise_does_not_retarget_motion(self):
+        p = self.popup
+        p.motion_enabled = True
+        p.move(50, 50)
+        self.cursor = QPoint(600, 400)
+        self.tick()
+        goal = QPointF(p._follow_goal)
+        self.cursor = QPoint(601, 401)
+        self.tick()
+        self.assertEqual(p._follow_goal, goal)
+        self.cursor = QPoint(610, 410)
+        self.tick()
+        self.assertNotEqual(p._follow_goal, goal)
+
+    def test_follow_resumes_gently_after_toggle_and_capture_pause(self):
+        p = self.popup
+        p.motion_enabled = True
+        p.follow_button.setChecked(False)
+        self.cursor = QPoint(600, 400)
+        origin = p.pos()
+        self.tick(20)
+        self.assertEqual(p.pos(), origin)
+        p.follow_button.setChecked(True)
+        p._follow_timer.stop()
+        self.tick()
+        self.assertLess((p.pos() - origin).manhattanLength(), 20)
+        p.desktop.busy = True
+        origin = p.pos()
+        self.tick(100)
+        self.assertEqual(p.pos(), origin)
+        self.assertIsNone(p._follow_position)
+        p.desktop.busy = False
+        self.tick()
+        self.assertLess((p.pos() - origin).manhattanLength(), 20)
+
+    def test_cross_monitor_follow_uses_logical_coordinates_and_stays_visible(self):
+        p = self.popup
+        p.motion_enabled = True
+        for bounds in ((QRect(-1280, -200, 1280, 720), QRect(0, 0, 1920, 1080)),
+                       (QRect(0, 0, 800, 600), QRect(1600, 400, 800, 600))):
+            with self.subTest(bounds=bounds):
+                screens = [Mock(), Mock()]
+                for screen, area, scale in zip(screens, bounds, (1.5, 2)):
+                    screen.availableGeometry.return_value = area
+                    screen.devicePixelRatio.return_value = scale
+                p.move(bounds[0].topLeft() + QPoint(40, 40))
+                p._reset_follow_motion()
+                p._placement_bounds = None
+                p._follow_paused = False
+                self.cursor = bounds[1].bottomRight() - QPoint(20, 20)
+                with (patch('ui.popup.QApplication.screenAt', return_value=screens[1]),
+                      patch('ui.popup.QApplication.screens', return_value=screens)):
+                    origin = p.pos()
+                    self.tick()
+                    self.assertLess((p.pos() - origin).manhattanLength(), 100)
+                    for _ in range(250):
+                        self.tick()
+                        self.assertTrue(any(area.intersects(p.geometry()) for area in bounds))
+                self.assertTrue(bounds[1].contains(p.geometry()))
+                self.assertEqual(p.width(), p.WIDTH + 2 * p.SHADOW_MARGIN)
+
+    def finish_response(self, text, *, streamed=False, request_id=100):
+        p = self.popup
+        p._cancel_response()
+        p._copy_available = False
+        p.response.clear()
+        p._request_id = request_id
+        p._expand_to(p.RESPONSE_HEIGHT)
+        p.thinking.show()
+        if streamed:
+            for part in (text[:len(text) // 2], text[len(text) // 2:]):
+                p._pipeline_partial(request_id, part)
+                self.assertFalse(p.copy_button.isEnabled())
+        p._pipeline_completed(request_id, text)
+        self.app.processEvents()
+
+    def test_copy_is_disabled_until_a_completed_response(self):
+        p = self.popup
+        self.assertFalse(p.copy_button.isEnabled())
+        p._request_id = 100
+        p._expand_to(260)
+        p.thinking.show()
+        p._pipeline_status(100, 'Thinking…')
+        self.assertFalse(p.copy_button.isEnabled())
+        p._pipeline_partial(100, 'An unfinished answer')
+        self.assertFalse(p.copy_button.isEnabled())
+        p._pipeline_failed(100, 'Ollama is unavailable')
+        self.assertFalse(p.copy_button.isEnabled())
+
+    def test_copy_streamed_answer_only_and_brief_checkmark_feedback(self):
+        p = self.popup
+        p.prompt.setText('The user prompt must not be copied')
+        self.finish_response('The displayed answer.\nOnly this text.', streamed=True)
+        self.assertTrue(p.copy_button.isEnabled())
+        self.assertEqual(p.copy_button.accessibleName(), 'Copy response')
+        with patch('ui.popup.QApplication.clipboard') as clipboard:
+            p.copy_button.click()
+            clipboard.return_value.setText.assert_called_once_with('The displayed answer.\nOnly this text.')
+        self.assertTrue(p.copy_button.copied)
+        self.assertEqual(p.copy_button.toolTip(), 'Copied')
+        p._copy_timer.setInterval(10)
+        p._copy_timer.start()
+        QTest.qWait(30)
+        self.assertFalse(p.copy_button.copied)
+        self.assertEqual(p.copy_button.toolTip(), 'Copy response')
+
+    def test_copy_tool_result_and_reset_for_new_response(self):
+        p = self.popup
+        self.finish_response('Asked Windows to open notepad.')
+        with patch('ui.popup.QApplication.clipboard') as clipboard:
+            p.copy_button.click()
+            self.assertTrue(p.copy_button.copied)
+            p.prompt.setText('A new request')
+            p.submit()
+            self.assertFalse(p.copy_button.isEnabled())
+            self.assertFalse(p.copy_button.copied)
+            self.assertFalse(p._copy_timer.isActive())
+            p._pipeline_partial(100, 'A stale response')
+            self.assertFalse(p.copy_button.isEnabled())
+            QTest.qWait(100)
+            self.assertTrue(p.copy_button.isEnabled())
+            p.copy_button.click()
+            self.assertEqual(clipboard.return_value.setText.call_args.args[0], 'Test response: A new request')
+
+    def test_copy_does_not_cover_scrollbar_or_change_selection_and_scroll(self):
+        p = self.popup
+        text = 'A long response line.\n' * 100
+        self.finish_response(text)
+        scrollbar = p.response.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum() // 2)
+        selection = p.response.textCursor()
+        selection.setPosition(10)
+        selection.setPosition(24, QTextCursor.MoveMode.KeepAnchor)
+        p.response.setTextCursor(selection)
+        selected = p.response.textCursor().selectedText()
+        scroll_position = scrollbar.value()
+        self.assertFalse(p.copy_button.geometry().intersects(p.response.viewport().geometry()))
+        scrollbar_rect = QRect(scrollbar.mapTo(p.response, QPoint()), scrollbar.size())
+        self.assertFalse(p.copy_button.geometry().intersects(scrollbar_rect))
+        with patch('ui.popup.QApplication.clipboard') as clipboard:
+            p.copy_button.click()
+            clipboard.return_value.setText.assert_called_once_with(text)
+        self.assertEqual(p.response.textCursor().selectedText(), selected)
+        self.assertEqual(scrollbar.value(), scroll_position)
 
     def test_opening_hotkey_toggles_and_escape_dismisses(self):
         p = self.popup

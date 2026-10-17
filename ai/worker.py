@@ -43,9 +43,16 @@ class RequestWorker(QThread):
         self.history = history
         self.context = context
         self.cancel_event = Event()
+        # Non-GUI actions (discovery/launch/audio) stay off the GUI thread too.
+        from integration.actions import WindowsActions
+        self.actions = WindowsActions()
 
     def _desktop(self, kind, payload):
         check_cancelled(self.cancel_event)
+        if kind == "prepare_commands":
+            return self.actions.prepare_commands(payload)
+        if kind == "command" and payload["name"] not in ("copy_text", "press_hotkey"):
+            return self.actions.execute(payload)
         call = DesktopCall(kind, payload, self.context, self.cancel_event)
         self.desktop_requested.emit(self.request_id, call)
         while not call.done.wait(0.05):

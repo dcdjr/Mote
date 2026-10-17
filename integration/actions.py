@@ -4,7 +4,9 @@ import ctypes
 import os
 import sys
 from ctypes import wintypes
-from urllib.parse import urlsplit
+from router.urls import normalize_url
+from integration.apps import get_catalog
+from integration.audio import change_volume
 
 from ai.pipeline import PipelineError, validate_command
 
@@ -113,6 +115,18 @@ def send_hotkey(shortcut, target):
 
 
 class WindowsActions:
+    def __init__(self, *, catalog=None):
+        self.catalog = catalog or get_catalog()
+
+    def prepare_commands(self, commands):
+        if sys.platform != "win32":
+            raise PipelineError("Windows desktop commands are unavailable in Linux/macOS preview.")
+        for command in commands:
+            command = validate_command(command)
+            if command["name"] == "open_application" and command["arguments"]["application"] not in APPLICATIONS:
+                self.catalog.resolve(command["arguments"]["application"])
+        return None
+
     def execute(self, command, *, clipboard=None):
         command = validate_command(command)  # Revalidate at the execution boundary.
         name, arguments = command["name"], command["arguments"]
@@ -124,24 +138,29 @@ class WindowsActions:
             clipboard.setText(arguments["text"])
             return "Copied the requested text to the clipboard."
         if name in ("set_volume", "adjust_volume"):
-            raise PipelineError("Volume control is not integrated yet. Ask Mote to open sound settings instead.")
+            try:
+                return change_volume(name, arguments)
+            except Exception as error:
+                raise PipelineError(f"Windows volume control failed: {error}. Check your audio output and reinstall requirements.txt.") from error
         if name == "press_hotkey":
             raise PipelineError("Keyboard shortcuts require confirmation and a verified target window.")
         if name == "open_application":
-            destination = APPLICATIONS[arguments["application"]]
+            app_name = arguments["application"]
+            if app_name not in APPLICATIONS:
+                app = self.catalog.resolve(app_name)
+                try:
+                    self.catalog.launch(app)
+                except OSError as error:
+                    raise PipelineError(f"Windows could not open {app.name}: {error}") from error
+                return f"Asked Windows to open {app.name}."
+            destination = APPLICATIONS[app_name]
         elif name == "open_windows_settings":
             destination = "ms-settings:" + SETTINGS[arguments["page"]]
         elif name == "open_website":
-            destination = arguments["url"]
-            parsed = urlsplit(destination)
-            if (parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username
-                    or parsed.password or "\\" in destination
-                    or any(ord(char) < 33 or ord(char) == 127 for char in destination)):
-                raise PipelineError("Only valid HTTP/HTTPS website addresses without credentials are allowed.")
             try:
-                _ = parsed.port  # Access validates the port's syntax and range.
-            except ValueError:
-                raise PipelineError("The website address has an invalid port.") from None
+                destination = normalize_url(arguments["url"])
+            except ValueError as error:
+                raise PipelineError(str(error)) from error
         else:
             raise PipelineError("This command is not implemented; nothing was executed.")
         try:

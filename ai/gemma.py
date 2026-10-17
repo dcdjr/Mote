@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterator
 
 from ollama import Client, ResponseError
+from ai.runtime import keep_alive, model_options
 
 MODEL = os.getenv("MOTE_MODEL", "gemma4:e2b")
 
@@ -52,7 +53,7 @@ class GemmaBackend:
             try:
                 stream = self.client.chat(
                     model=self.model, messages=messages, stream=True,
-                    keep_alive="30m", **options,
+                    keep_alive=keep_alive(), options=model_options(), **options,
                 )
                 for chunk in stream:
                     if chunk.message.content:

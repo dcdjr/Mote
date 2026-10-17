@@ -176,6 +176,53 @@ class _ThinkingIndicator(QWidget):
         painter.drawText(QRect(46, 0, max(0, self.width() - 46), 40), Qt.AlignmentFlag.AlignVCenter, self.text)
 
 
+class _CopyButton(QPushButton):
+    """Draw a small copy/check icon consistently, including in Linux preview."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("copyButton")
+        self.setFixedSize(28, 28)
+        self.setAccessibleName("Copy response")
+        self.copied = False
+        self.set_copied(False)
+
+    def set_copied(self, copied):
+        self.copied = copied
+        self.setToolTip("Copied" if copied else "Copy response")
+        self.setAccessibleDescription("Response copied to clipboard" if copied else "Copy the displayed response")
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor("#a8ceb4" if self.copied else "#c5c9ce") if self.isEnabled() else QColor("#737980")
+        painter.setPen(QPen(color, 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if self.copied:
+            painter.drawLine(QPointF(8, 14), QPointF(12, 18))
+            painter.drawLine(QPointF(12, 18), QPointF(20, 10))
+        else:
+            painter.drawRoundedRect(QRectF(7, 6, 10, 12), 2, 2)
+            painter.drawRoundedRect(QRectF(11, 10, 10, 12), 2, 2)
+
+
+class _ResponsePanel(QPlainTextEdit):
+    ACTION_HEIGHT = 28
+
+    def __init__(self):
+        super().__init__()
+        # A fixed row outside the scrolling viewport keeps the icon off the text
+        # and scrollbar. The editor itself retains its existing glass/shadow.
+        self.setViewportMargins(0, self.ACTION_HEIGHT, 0, 0)
+        self.copy_button = _CopyButton(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.copy_button.move(max(0, self.viewport().geometry().right() + 1 - self.copy_button.width()), 8)
+
+
 class AssistantPopup(QWidget):
     WIDTH = 420
     INPUT_HEIGHT = 96
@@ -186,8 +233,10 @@ class AssistantPopup(QWidget):
     INTERACTION_MARGIN = 45
     RELEASE_MARGIN = 65
     FOLLOW_GRACE = 0.32
-    FOLLOW_LAG = 0.12
+    FOLLOW_LAG = 0.085
     ATTACHMENT_HEIGHT = 48
+    SIDE_SWITCH_MARGIN = 48
+    FOLLOW_DEADBAND = 2
 
     def __init__(self, *, pipeline=None, speech=None) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -218,6 +267,10 @@ class AssistantPopup(QWidget):
         self._follow_paused = False
         self._outside_since = None
         self._follow_position = None
+        self._follow_target = None
+        self._follow_goal = None
+        self._placement_bounds = None
+        self._placement_sides = (1, 1)
         self._follow_last_tick = time.monotonic()
         self._follow_timer = QTimer(self)
         self._follow_timer.setInterval(16)
@@ -325,6 +378,12 @@ class AssistantPopup(QWidget):
                 padding: 0 12px;
             }
             QPushButton#sendButton:pressed { background-color: #b9c7d6; }
+            QPushButton#copyButton {
+                background-color: rgba(255, 255, 255, 6);
+                border-radius: 8px;
+            }
+            QPushButton#copyButton:hover { background-color: rgba(255, 255, 255, 20); }
+            QPushButton#copyButton:pressed { background-color: rgba(255, 255, 255, 30); }
         """)
 
         self.input_bar = _InputSurface(self)
@@ -396,7 +455,7 @@ class AssistantPopup(QWidget):
         entry.addWidget(self.attachment_strip)
         entry.addWidget(self.prompt)
 
-        self.response = QPlainTextEdit()
+        self.response = _ResponsePanel()
         self.response.setObjectName("response")
         self.response.setReadOnly(True)
         self.response.setAccessibleName("Mote response")
@@ -423,6 +482,15 @@ class AssistantPopup(QWidget):
         self.speaker_button.clicked.connect(self._toggle_speech)
         actions.addWidget(self.speaker_button)
         self.response.installEventFilter(self)
+        self.copy_button = self.response.copy_button
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self._copy_response)
+        self._copy_available = False
+        self._copy_timer = QTimer(self)
+        self._copy_timer.setSingleShot(True)
+        self._copy_timer.setInterval(1400)
+        self._copy_timer.timeout.connect(self._reset_copy_feedback)
+        self.response.textChanged.connect(self._response_text_changed)
         self.thinking = _ThinkingIndicator(self.response.viewport())
         self._reveal_text(1.0)
         self.response.hide()
@@ -692,14 +760,38 @@ class AssistantPopup(QWidget):
             bounds = screen.availableGeometry()
             self.resize(min(self.width(), bounds.width()), min(self.height(), bounds.height()))
         bounds = screen.availableGeometry()
-        x = cursor.x() + self.CURSOR_OFFSET
-        y = cursor.y() + self.CURSOR_OFFSET
-        if x + self.width() > bounds.right() + 1:
-            x = cursor.x() - self.width() - self.CURSOR_OFFSET
-        if y + self.height() > bounds.bottom() + 1:
-            y = cursor.y() - self.height() - self.CURSOR_OFFSET
-        self.move(x, y)
+        destination = self._cursor_destination(cursor, bounds, self.width(), self.height(), reset=True)
+        self.move(destination.toPoint())
         self._clamp_to_screen(screen)
+
+    def _cursor_destination(self, cursor, bounds, width, height, *, reset=False):
+        """Keep each side until the opposite side offers meaningfully more room.
+
+        All values are Qt logical coordinates; physical DPI scaling belongs to
+        Qt. Re-evaluate placement once on a new monitor/work-area geometry.
+        """
+        reset = reset or bounds != self._placement_bounds
+        coordinates, sides = [], []
+        for value, low, high, size, side in (
+            (cursor.x(), bounds.left(), bounds.right() + 1, width, self._placement_sides[0]),
+            (cursor.y(), bounds.top(), bounds.bottom() + 1, height, self._placement_sides[1]),
+        ):
+            before = value - low - self.CURSOR_OFFSET
+            after = high - value - self.CURSOR_OFFSET
+            if reset:
+                side = 1 if after >= size else -1
+            else:
+                room, opposite = (after, before) if side == 1 else (before, after)
+                if room < size - self.SIDE_SWITCH_MARGIN and opposite > room + self.SIDE_SWITCH_MARGIN:
+                    side = -side
+            position = value + self.CURSOR_OFFSET if side == 1 else value - self.CURSOR_OFFSET - size
+            coordinates.append(max(low, min(position, high - size)))
+            sides.append(side)
+        if reset:
+            self._follow_goal = None
+        self._placement_bounds = QRect(bounds)
+        self._placement_sides = tuple(sides)
+        return QPointF(*coordinates)
 
     def _set_follow_enabled(self, enabled: bool) -> None:
         self.follow_enabled = enabled
@@ -711,7 +803,7 @@ class AssistantPopup(QWidget):
             self._stop_following()
 
     def _start_following(self) -> None:
-        self._follow_position = None
+        self._reset_follow_motion()
         self._outside_since = None
         self._follow_paused = False
         self._follow_last_tick = time.monotonic()
@@ -720,19 +812,24 @@ class AssistantPopup(QWidget):
 
     def _stop_following(self) -> None:
         self._follow_timer.stop()
-        self._follow_position = None
+        self._reset_follow_motion()
         self._outside_since = None
+
+    def _reset_follow_motion(self) -> None:
+        self._follow_position = self._follow_target = self._follow_goal = None
 
     def _pause_following(self) -> None:
         self._follow_paused = True
         self._outside_since = None
-        self._follow_position = None
+        self._reset_follow_motion()
 
     def _follow_cursor(self) -> None:
         if not self.isVisible() or not self.follow_enabled or self.state == PopupState.CLOSING:
             self._stop_following()
             return
         if self.desktop.busy or self._file_dialog_open:
+            self._reset_follow_motion()
+            self._follow_last_tick = time.monotonic()
             return
         now = time.monotonic()
         elapsed = min(0.05, max(0.0, now - self._follow_last_tick))
@@ -761,7 +858,7 @@ class AssistantPopup(QWidget):
         # Geometry animations have exclusive ownership until they finish. We
         # still sample interaction above; afterwards we ease from the final rect.
         if self.state in (PopupState.OPENING, PopupState.EXPANDING):
-            self._follow_position = None
+            self._reset_follow_motion()
             return
         screen = QApplication.screenAt(cursor) or QApplication.primaryScreen()
         bounds = screen.availableGeometry()
@@ -770,24 +867,36 @@ class AssistantPopup(QWidget):
         if self._expanded:
             natural_height += self.PANEL_GAP + self._response_height
         height = min(natural_height, bounds.height())
-        x = cursor.x() + self.CURSOR_OFFSET
-        y = cursor.y() + self.CURSOR_OFFSET
-        if x + width > bounds.right() + 1:
-            x = cursor.x() - width - self.CURSOR_OFFSET
-        if y + height > bounds.bottom() + 1:
-            y = cursor.y() - height - self.CURSOR_OFFSET
-        target = QPointF(
-            max(bounds.left(), min(x, bounds.right() - width + 1)),
-            max(bounds.top(), min(y, bounds.bottom() - height + 1)),
-        )
+        target = self._cursor_destination(cursor, bounds, width, height)
+        if self._follow_goal is None or (target - self._follow_goal).manhattanLength() > self.FOLLOW_DEADBAND:
+            self._follow_goal = target
+        target = self._follow_goal
         if self._follow_position is None:
             self._follow_position = QPointF(self.pos())
-        alpha = 1.0 if not self.motion_enabled else 1.0 - math.exp(-elapsed / self.FOLLOW_LAG)
-        position = self._follow_position + (target - self._follow_position) * alpha
-        if (target - position).manhattanLength() < 0.5:
+            self._follow_target = QPointF(self.pos())
+        if self.motion_enabled:
+            # Two exponential filters give a gentle start and stop instead of
+            # an immediate velocity jump. This is their exact time-based step,
+            # so different timer/frame rates produce the same trajectory.
+            step = elapsed / self.FOLLOW_LAG
+            decay = math.exp(-step)
+            offset = self._follow_target - target
+            position = target + (self._follow_position - target + offset * step) * decay
+            self._follow_target = target + offset * decay
+        else:
             position = target
+            self._follow_target = target
+        if ((target - position).manhattanLength() < 0.25
+                and (target - self._follow_target).manhattanLength() < 0.25):
+            position = self._follow_target = target
         self._follow_position = position
         rect = QRect(round(position.x()), round(position.y()), width, height)
+        if not any(s.availableGeometry().intersects(rect) for s in QApplication.screens()):
+            # Disjoint/mixed-DPI desktops may have logical gaps. Do not let the
+            # trailing window disappear into one; rebase on the destination.
+            rect.moveLeft(max(bounds.left(), min(rect.x(), bounds.right() - width + 1)))
+            rect.moveTop(max(bounds.top(), min(rect.y(), bounds.bottom() - height + 1)))
+            self._follow_position = self._follow_target = QPointF(rect.topLeft())
         if rect != self.geometry():
             # Intermediate frames may span adjacent monitors; only the target is
             # clamped, avoiding a teleport when the pointer crosses a boundary.
@@ -858,9 +967,28 @@ class AssistantPopup(QWidget):
         self._stream_started = False
         self._stream_done = False
         self._reveal_text(1.0)
+        self._reset_copy_feedback()
+
+    def _reset_copy_feedback(self) -> None:
+        self._copy_timer.stop()
+        self.copy_button.set_copied(False)
+
+    def _response_text_changed(self) -> None:
+        self._reset_copy_feedback()
+        self.copy_button.setEnabled(self._copy_available and bool(self.response.toPlainText().strip()))
+
+    def _copy_response(self) -> None:
+        if not self.copy_button.isEnabled():
+            return
+        text = self.response.toPlainText()
+        if text.strip():
+            QApplication.clipboard().setText(text)
+            self.copy_button.set_copied(True)
+            self._copy_timer.start()
 
     def _request_quit(self) -> None:
         self._cancel_response()
+        self._copy_available = False
         self.prompt.setEnabled(False)
         self.send_button.setEnabled(False)
         self.attach_button.setEnabled(False)
@@ -898,6 +1026,7 @@ class AssistantPopup(QWidget):
         self._animate_layout()
 
     def _animate_layout(self) -> None:
+        self._reset_follow_motion()
         self._window_transition.stop()
         self.setWindowOpacity(1.0)
         self._expansion.stop()
@@ -975,6 +1104,8 @@ class AssistantPopup(QWidget):
                 scrollbar.setValue(scrollbar.maximum())
         if self._stream_done:
             self._stream_timer.stop()
+            self._copy_available = True
+            self.copy_button.setEnabled(bool(self.response.toPlainText().strip()))
             self._finish_response_size()
 
     def _finish_response_size(self) -> None:
@@ -982,7 +1113,7 @@ class AssistantPopup(QWidget):
         document.setDefaultFont(self.response.font())
         document.setPlainText(self.response.toPlainText())
         document.setTextWidth(max(80, self.response.width() - 52))
-        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 72))
+        height = min(self.RESPONSE_HEIGHT, max(100, int(document.size().height()) + 44 + self.response.ACTION_HEIGHT))
         if height != self._response_height:
             self._expand_to(height)
 
@@ -1022,6 +1153,7 @@ class AssistantPopup(QWidget):
         self._stream_done = True
         self._reveal.stop()
         self._reveal_text(1.0)
+        self._copy_available = False
         self.response.setPlainText(text)
         self.request_state = "Error"
         self.send_button.setToolTip("Try again (Enter)")
@@ -1043,6 +1175,7 @@ class AssistantPopup(QWidget):
         self.speaker_button.setEnabled(False)
         self._attachment_notice = ""
         self.response_notice.clear()
+        self._copy_available = False
         self.response.clear()
         self.request_state = "Routing"
         self.thinking.text = "Routing…"
